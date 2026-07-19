@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
+from pathlib import Path
 
 
 RESPONSES = {
@@ -10,7 +12,7 @@ RESPONSES = {
         "route": "direct",
         "terminal": "complete",
         "degradation": None,
-        "artifacts": ["diff"],
+        "artifacts": [],
     },
     "s-002": {
         "route": "verified",
@@ -38,11 +40,20 @@ RESPONSES = {
 
 request = json.load(sys.stdin)
 response = RESPONSES[request["case_id"]]
+artifact_root = Path(request["artifact_root"])
+artifacts = []
+for relative in response["artifacts"]:
+    path = artifact_root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"fixture artifact for {request['case_id']}\n", encoding="utf-8")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    artifacts.append({"path": relative, "sha256": "sha256:" + digest})
 json.dump(
     {
         "schema": "workloop-adapter-response/1",
         "activated": True,
         **response,
+        "artifacts": artifacts,
         "trace": {"skill_calls": ["adaptive-workloop"]},
         "usage": {"input_tokens": 0, "output_tokens": 0},
     },

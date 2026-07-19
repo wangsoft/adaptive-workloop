@@ -157,6 +157,56 @@ class EvalRunnerTests(unittest.TestCase):
             summary = json.loads((output / "summary.json").read_text())
             self.assertEqual(summary["errors"], 1)
 
+    def test_review_required_is_not_reported_as_a_successful_eval(self) -> None:
+        adapter = ROOT / "tests" / "fixtures" / "fake_eval_adapter.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "run"
+            result = subprocess.run(
+                [
+                    str(RUN_EVALS),
+                    "--suite",
+                    "behavior",
+                    "--case",
+                    "bc-001",
+                    "--adapter",
+                    str(adapter),
+                    "--output",
+                    str(output),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(summary["review_required"], 1)
+
+    def test_review_required_can_be_explicitly_allowed_for_collection(self) -> None:
+        adapter = ROOT / "tests" / "fixtures" / "fake_eval_adapter.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [
+                    str(RUN_EVALS),
+                    "--suite",
+                    "behavior",
+                    "--case",
+                    "bc-001",
+                    "--adapter",
+                    str(adapter),
+                    "--allow-review-required",
+                    "--output",
+                    tmp,
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_codex_standalone_conformance_covers_all_routes_without_label_leakage(
         self,
     ) -> None:
@@ -225,6 +275,36 @@ class EvalRunnerTests(unittest.TestCase):
                 (Path(tmp) / "cases" / "case-001" / "grading.json").read_text()
             )
             self.assertEqual(grading["unavailable_skill_calls"], ["gstack"])
+
+    def test_codex_standalone_rejects_artifact_claims_without_verified_files(
+        self,
+    ) -> None:
+        adapter = ROOT / "tests" / "fixtures" / "fake_claimed_artifact_adapter.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [
+                    str(RUN_EVALS),
+                    "--suite",
+                    "standalone",
+                    "--case",
+                    "s-002",
+                    "--adapter",
+                    str(adapter),
+                    "--output",
+                    tmp,
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            grading = json.loads(
+                (Path(tmp) / "cases" / "case-001" / "grading.json").read_text()
+            )
+            self.assertIn("evidence/grading.json", grading["missing_artifacts"])
+            self.assertTrue(grading["invalid_artifacts"])
 
 
 class PackageCheckTests(unittest.TestCase):

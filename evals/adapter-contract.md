@@ -25,13 +25,14 @@
   },
   "prompt": "Resume the workloop episode from yesterday",
   "setup": {},
+  "artifact_root": "/runner-owned/output/cases/case-001/workspace",
   "skill": {"name": "adaptive-workloop", "path": "/path/to/skill"}
 }
 ```
 
 For `bare`, `skill` is `null`. For `previous`, the adapter resolves the pinned previous Skill revision outside the request. Keep repository fixture, runtime envelope, tool catalog, and sampling configuration equal across paired conditions.
 
-`host_profile` is optional for the general suites and mandatory for standalone conformance. Its digest binds the exact capability envelope to the run. `installed_skills` lists optional Skills available in addition to the candidate under test.
+`host_profile` is optional for the general suites and mandatory for standalone conformance. Its digest binds the exact capability envelope to the run. `installed_skills` lists optional Skills available in addition to the candidate under test. During an adapter execution, the runner creates `artifact_root` inside that case's output directory. Dry-run requests omit it.
 
 ## Response
 
@@ -43,7 +44,10 @@ For `bare`, `skill` is `null`. For `previous`, the adapter resolves the pinned p
   "terminal": "complete",
   "degradation": "durable-serial",
   "transcript": "raw agent transcript or artifact pointer",
-  "artifacts": ["workspace://..."],
+  "artifacts": [{
+    "path": ".workloop/tracked/example/state.json",
+    "sha256": "sha256:..."
+  }],
   "usage": {
     "input_tokens": 0,
     "cached_input_tokens": 0,
@@ -64,7 +68,9 @@ For `bare`, `skill` is `null`. For `previous`, the adapter resolves the pinned p
 
 Trigger cases are graded exactly by the runner. Behavior and regression outputs remain `review_required` until an independent grader evaluates their transcript, state, artifacts, and trace. Do not let the producing adapter grade itself.
 
-Standalone cases are also code-graded. The adapter must derive `trace.skill_calls` from host instrumentation rather than model prose. Any Skill other than `adaptive-workloop` fails the Codex-standalone profile; required artifacts, terminal state, route, and explicit degradation mode must also match.
+Standalone cases are also code-graded. The adapter must derive `trace.skill_calls` from host instrumentation rather than model prose. Any Skill other than `adaptive-workloop` fails the Codex-standalone profile; required artifacts, terminal state, route, and explicit degradation mode must also match. Every returned artifact path must be relative to `artifact_root`, resolve inside it, name a regular file, and match the declared SHA-256. Strings, missing files, symlink escapes, duplicate paths, and digest mismatches fail grading.
+
+Exit status 0 means all code-graded cases passed. Status 1 means a failure or adapter error, 2 means invalid invocation or suite data, and 3 means all produced outputs are valid but at least one still requires independent review. Use `--allow-review-required` only for an explicit collection stage that handles that pending review downstream.
 
 ## Matrix protocol
 

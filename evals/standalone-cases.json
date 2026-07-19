@@ -1,6 +1,6 @@
 {
   "suite": "adaptive-workloop/standalone",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "required_host_profile": "codex-standalone",
   "purpose": "Prove that the candidate can execute every route without optional specialist Skills.",
   "cases": [

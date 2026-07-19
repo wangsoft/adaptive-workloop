@@ -49,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--allow-review-required",
+        action="store_true",
+        help="return success when all non-error outputs only await independent review",
+    )
     return parser.parse_args()
 
 
@@ -272,7 +277,67 @@ def grade_trigger(
     }
 
 
-def grade_standalone(case: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def artifact_matches_required(path: str, required: str) -> bool:
+    return path == required or path.endswith("/" + required)
+
+
+def verify_artifacts(
+    response: dict[str, Any], artifact_root: Path
+) -> tuple[list[dict[str, str]], list[str]]:
+    records = response.get("artifacts")
+    if not isinstance(records, list):
+        return [], ["artifacts must be an array"]
+
+    root = artifact_root.resolve()
+    verified: list[dict[str, str]] = []
+    invalid: list[str] = []
+    seen: set[str] = set()
+    for index, record in enumerate(records):
+        label = f"artifacts[{index}]"
+        if not isinstance(record, dict):
+            invalid.append(f"{label} must be an object with path and sha256")
+            continue
+        relative = record.get("path")
+        claimed_digest = record.get("sha256")
+        if not isinstance(relative, str) or not relative:
+            invalid.append(f"{label}.path must be a non-empty relative path")
+            continue
+        if relative in seen:
+            invalid.append(f"{label}.path is duplicated: {relative}")
+            continue
+        seen.add(relative)
+        relative_path = Path(relative)
+        if relative_path.is_absolute():
+            invalid.append(f"{label}.path must be relative: {relative}")
+            continue
+        candidate = (root / relative_path).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            invalid.append(f"{label}.path escapes artifact_root: {relative}")
+            continue
+        if not candidate.is_file():
+            invalid.append(f"{label}.path is not a regular file: {relative}")
+            continue
+        actual_digest = file_sha256(candidate)
+        if claimed_digest != actual_digest:
+            invalid.append(f"{label}.sha256 does not match file: {relative}")
+            continue
+        verified.append({"path": relative_path.as_posix(), "sha256": actual_digest})
+    return verified, invalid
+
+
+def grade_standalone(
+    case: dict[str, Any], response: dict[str, Any], artifact_root: Path
+) -> dict[str, Any]:
     expected = case["expected"]
     activated_pass = response.get("activated") is True
     route_pass = response.get("route") == expected["route"]
@@ -290,19 +355,15 @@ def grade_standalone(case: dict[str, Any], response: dict[str, Any]) -> dict[str
         else ["<invalid-trace>"]
     )
 
-    artifacts = response.get("artifacts")
-    artifacts_valid = isinstance(artifacts, list) and all(
-        isinstance(item, str) for item in artifacts
-    )
-    missing_artifacts = []
-    if artifacts_valid:
-        missing_artifacts = [
-            required
-            for required in expected["required_artifacts"]
-            if not any(artifact.endswith(required) for artifact in artifacts)
-        ]
-    else:
-        missing_artifacts = list(expected["required_artifacts"])
+    verified_artifacts, invalid_artifacts = verify_artifacts(response, artifact_root)
+    missing_artifacts = [
+        required
+        for required in expected["required_artifacts"]
+        if not any(
+            artifact_matches_required(artifact["path"], required)
+            for artifact in verified_artifacts
+        )
+    ]
 
     passed = all(
         (
@@ -312,7 +373,7 @@ def grade_standalone(case: dict[str, Any], response: dict[str, Any]) -> dict[str
             degradation_pass,
             trace_valid,
             not unavailable_skill_calls,
-            artifacts_valid,
+            not invalid_artifacts,
             not missing_artifacts,
         )
     )
@@ -340,6 +401,8 @@ def grade_standalone(case: dict[str, Any], response: dict[str, Any]) -> dict[str
             "passed": degradation_pass,
         },
         "unavailable_skill_calls": unavailable_skill_calls,
+        "verified_artifacts": verified_artifacts,
+        "invalid_artifacts": invalid_artifacts,
         "missing_artifacts": missing_artifacts,
     }
 
@@ -478,6 +541,9 @@ def main() -> int:
         artifact_id = f"case-{index:03d}"
         case_dir = output / "cases" / artifact_id
         case_dir.mkdir(parents=True)
+        artifact_root = case_dir / "workspace"
+        artifact_root.mkdir()
+        request["artifact_root"] = str(artifact_root.resolve())
         write_json(case_dir / "request.json", request)
         try:
             response, stderr, duration = run_adapter(
@@ -492,7 +558,7 @@ def main() -> int:
                 else:
                     failed += 1
             elif args.suite == "standalone":
-                grading = grade_standalone(case, response)
+                grading = grade_standalone(case, response, artifact_root)
                 if grading["status"] == "passed":
                     passed += 1
                 else:
@@ -545,7 +611,11 @@ def main() -> int:
     print(
         f"summary: {passed} passed, {failed} failed, {review_required} review required, {errors} errors"
     )
-    return 1 if failed or errors else 0
+    if failed or errors:
+        return 1
+    if review_required and not args.allow_review_required:
+        return 3
+    return 0
 
 
 if __name__ == "__main__":
