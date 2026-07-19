@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Emit deterministic repository facts plus an optional host capability manifest."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+CAPABILITY_FIELDS = (
+    "subagents",
+    "browser",
+    "context_budget",
+    "effort_mode",
+    "permission_mode",
+    "native_orchestration",
+    "installed_skills",
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("target", nargs="?", type=Path, default=Path.cwd())
+    parser.add_argument("--capabilities", type=Path)
+    return parser.parse_args()
+
+
+def run(*argv: str, cwd: Path) -> str:
+    if shutil.which(argv[0]) is None:
+        return ""
+    result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip() or result.stderr.strip()
+
+
+def host() -> dict[str, str]:
+    env = os.environ
+    if env.get("CLAUDECODE") or env.get("CLAUDE_CODE_ENTRYPOINT"):
+        return {"name": "claude-code", "evidence": "host environment marker"}
+    if env.get("CODEX_HOME") or env.get("CODEX_SANDBOX"):
+        return {"name": "codex", "evidence": "host environment marker"}
+    if env.get("CURSOR_TRACE_ID") or env.get("CURSOR_AGENT"):
+        return {"name": "cursor", "evidence": "host environment marker"}
+    if env.get("GITHUB_ACTIONS") == "true":
+        return {"name": "github-actions", "evidence": "CI environment marker"}
+    if env.get("GITLAB_CI"):
+        return {"name": "gitlab-ci", "evidence": "CI environment marker"}
+    return {"name": "unknown", "evidence": "no supported host marker; self-report is allowed"}
+
+
+def runtime_version(executable: str, *args: str) -> str | None:
+    output = run(executable, *args, cwd=Path.cwd())
+    return output.splitlines()[0] if output else None
+
+
+def package_scripts(root: Path) -> tuple[str | None, dict[str, str], list[str]]:
+    commands: dict[str, str] = {}
+    evidence: list[str] = []
+    package_manager: str | None = None
+    if (root / "pnpm-lock.yaml").is_file():
+        package_manager = "pnpm"
+    elif (root / "yarn.lock").is_file():
+        package_manager = "yarn"
+    elif (root / "bun.lock").is_file() or (root / "bun.lockb").is_file():
+        package_manager = "bun"
+    elif (root / "package-lock.json").is_file() or (root / "package.json").is_file():
+        package_manager = "npm"
+    package_json = root / "package.json"
+    if package_manager and package_json.is_file():
+        try:
+            package = json.loads(package_json.read_text(encoding="utf-8"))
+            scripts = package.get("scripts", {})
+            if isinstance(scripts, dict):
+                for name in ("test", "lint", "build", "typecheck"):
+                    if isinstance(scripts.get(name), str):
+                        commands[name] = f"{package_manager} run {name}"
+                if commands:
+                    evidence.append("package.json scripts")
+        except (OSError, json.JSONDecodeError):
+            evidence.append("package.json invalid or unreadable")
+    return package_manager, commands, evidence
+
+
+def verification_commands(root: Path) -> tuple[dict[str, str | None], list[str]]:
+    package_manager, commands, evidence = package_scripts(root)
+    makefile = root / "Makefile"
+    if makefile.is_file():
+        text = makefile.read_text(encoding="utf-8", errors="replace")
+        targets = set(re.findall(r"(?m)^([A-Za-z0-9_.-]+)\s*:", text))
+        for name in ("test", "lint", "build", "typecheck"):
+            if name in targets:
+                commands.setdefault(name, f"make {name}")
+        if "check" in targets:
+            commands.setdefault("test", "make check")
+        if targets.intersection({"test", "lint", "build", "typecheck", "check"}):
+            evidence.append("Makefile targets")
+    if "test" not in commands and (
+        (root / "pytest.ini").is_file() or (root / "pyproject.toml").is_file() or (root / "tests").is_dir()
+    ) and importlib.util.find_spec("pytest") is not None:
+        commands["test"] = "python3 -m pytest"
+        evidence.append("pytest markers and importable pytest")
+    if (root / "Cargo.toml").is_file():
+        commands.setdefault("test", "cargo test")
+        commands.setdefault("build", "cargo build")
+        evidence.append("Cargo.toml")
+    if (root / "go.mod").is_file():
+        commands.setdefault("test", "go test ./...")
+        commands.setdefault("build", "go build ./...")
+        commands.setdefault("lint", "go vet ./...")
+        evidence.append("go.mod")
+    value = {name: commands.get(name) for name in ("test", "lint", "build", "typecheck")}
+    value["package_manager"] = package_manager
+    return value, evidence
+
+
+def load_capabilities(path: Path | None) -> tuple[dict[str, Any] | None, str]:
+    raw = os.environ.get("WORKLOOP_CAPABILITIES_JSON")
+    source = "environment"
+    if path is not None:
+        raw = path.read_text(encoding="utf-8")
+        source = "host-manifest"
+    if not raw:
+        return None, "self-report-required"
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("capability manifest must be a JSON object")
+    if value.get("schema") not in (None, "workloop-capabilities/1"):
+        raise ValueError("unsupported capability manifest schema")
+    if "installed_skills" in value and not (
+        isinstance(value["installed_skills"], list)
+        and all(isinstance(item, str) for item in value["installed_skills"])
+    ):
+        raise ValueError("installed_skills must be a string array")
+    return value, source
+
+
+def main() -> int:
+    args = parse_args()
+    notes: list[str] = []
+    target = args.target.resolve()
+    if not target.is_dir():
+        notes.append(f"target directory not found: {target}; probed cwd instead")
+        target = Path.cwd().resolve()
+
+    inside_git = run("git", "rev-parse", "--is-inside-work-tree", cwd=target) == "true"
+    status = run("git", "status", "--porcelain=v1", cwd=target) if inside_git else ""
+    verify_commands, detected_from = verification_commands(target)
+    if not verify_commands["test"]:
+        notes.append("no test command detected; build a check seam or route to Reviewed")
+    try:
+        capability_manifest, capability_source = load_capabilities(args.capabilities)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(json.dumps({"schema": "workloop-probe/2", "error": f"invalid capabilities: {exc}"}))
+        return 2
+
+    missing = [field for field in CAPABILITY_FIELDS if capability_manifest is None or field not in capability_manifest]
+    ci_system: str | None = None
+    if (target / ".github" / "workflows").is_dir():
+        ci_system = "github-actions"
+    elif (target / ".gitlab-ci.yml").is_file():
+        ci_system = "gitlab-ci"
+    elif (target / ".circleci").is_dir():
+        ci_system = "circleci"
+
+    markers = [
+        name
+        for name in ("package.json", "Makefile", "pyproject.toml", "pytest.ini", "Cargo.toml", "go.mod")
+        if (target / name).exists()
+    ]
+    output = {
+        "schema": "workloop-probe/2",
+        "probed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "target": str(target),
+        "os": {"name": platform.system() or "unknown", "arch": platform.machine() or "unknown"},
+        "host": host(),
+        "git": {
+            "available": shutil.which("git") is not None,
+            "repo": inside_git,
+            "branch": run("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=target) if inside_git else None,
+            "head": run("git", "rev-parse", "HEAD", cwd=target) if inside_git else None,
+            "dirty_files": len(status.splitlines()) if status else 0,
+            "state_digest": "sha256:" + hashlib.sha256(status.encode()).hexdigest(),
+            "version": runtime_version("git", "--version"),
+        },
+        "runtimes": {
+            "python3": runtime_version("python3", "--version"),
+            "node": runtime_version("node", "--version"),
+            "go": runtime_version("go", "version"),
+            "cargo": runtime_version("cargo", "--version"),
+        },
+        "runtime_envelope": {
+            "cpu_count": os.cpu_count(),
+            "network": "host-enforced-or-unknown",
+            "resource_limits": "host-enforced-or-unknown",
+        },
+        "project": {"markers": markers},
+        "verify_commands": {**verify_commands, "detected_from": detected_from},
+        "ci": {"present": ci_system is not None, "system": ci_system},
+        "capabilities": {
+            "source": capability_source,
+            "manifest": capability_manifest,
+            "self_report_required": missing,
+        },
+        "notes": notes,
+    }
+    print(json.dumps(output, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

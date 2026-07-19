@@ -1,0 +1,13 @@
+{
+  "schema": "workloop-capabilities/1",
+  "profile_id": "codex-standalone",
+  "description": "Codex with adaptive-workloop under evaluation and no optional specialist Skills or optional host capabilities.",
+  "host": "codex",
+  "subagents": false,
+  "browser": false,
+  "context_budget": "host-reported",
+  "effort_mode": "host-reported",
+  "permission_mode": "host-enforced",
+  "native_orchestration": "none",
+  "installed_skills": []
+}

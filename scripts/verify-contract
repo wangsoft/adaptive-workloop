@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Validate and execute structured adaptive-workloop completion checks."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+SCHEMA = "workloop-checks/1"
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+BLOCKED_EXECUTABLES = {
+    "bash",
+    "curl",
+    "dd",
+    "fish",
+    "mkfs",
+    "powershell",
+    "pwsh",
+    "reboot",
+    "rm",
+    "scp",
+    "sh",
+    "shutdown",
+    "ssh",
+    "sudo",
+    "wget",
+    "zsh",
+}
+INLINE_CODE_FLAGS = {"-c", "-e", "--eval"}
+MAX_CAPTURE_BYTES = 256_000
+
+
+class ContractError(ValueError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("target", type=Path, help="episode directory or checks.json")
+    parser.add_argument(
+        "--allow-manual-open",
+        action="store_true",
+        help="return success with open manual criteria; never use for close-out",
+    )
+    parser.add_argument(
+        "--allow-risk",
+        action="append",
+        default=[],
+        choices=("network", "external-side-effect"),
+        help="explicitly allow a non-local check risk class",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="validate and print checks without executing")
+    return parser.parse_args()
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def bounded(text: str | bytes | None) -> tuple[str, bool]:
+    if text is None:
+        text = ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= MAX_CAPTURE_BYTES:
+        return text, False
+    clipped = encoded[:MAX_CAPTURE_BYTES].decode("utf-8", errors="replace")
+    return clipped + "\n[output truncated]\n", True
+
+
+def resolve_target(target: Path) -> tuple[Path, Path, Path]:
+    resolved = target.resolve()
+    checks = resolved / "checks.json" if resolved.is_dir() else resolved
+    if not checks.is_file():
+        raise ContractError(f"checks file not found: {checks}")
+    episode = checks.parent
+    root = Path.cwd().resolve()
+    for parent in (episode, *episode.parents):
+        if parent.name == ".workloop":
+            root = parent.parent.resolve()
+            break
+    return checks, episode, root
+
+
+def load_contract(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ContractError(f"invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ContractError("checks document must be a JSON object")
+    if value.get("schema") != SCHEMA:
+        raise ContractError(f"schema must be {SCHEMA!r}")
+    if not isinstance(value.get("checks"), list) or not isinstance(value.get("manual"), list):
+        raise ContractError("checks and manual must both be arrays")
+    if not value["checks"] and not value["manual"]:
+        raise ContractError("no criteria found; an empty contract cannot pass")
+    return value
+
+
+def validate_id(value: Any, where: str) -> str:
+    if not isinstance(value, str) or not ID_RE.fullmatch(value):
+        raise ContractError(f"{where}.id must match ^[a-z0-9][a-z0-9-]{{0,63}}$")
+    return value
+
+
+def validate_check(raw: Any, index: int, root: Path, allowed_risks: set[str]) -> dict[str, Any]:
+    where = f"checks[{index}]"
+    if not isinstance(raw, dict):
+        raise ContractError(f"{where} must be an object")
+    check_id = validate_id(raw.get("id"), where)
+    description = raw.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise ContractError(f"{where}.description must be a non-empty string")
+    argv = raw.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) and arg for arg in argv):
+        raise ContractError(f"{where}.argv must be a non-empty string array; freeform command strings are forbidden")
+    executable = Path(argv[0]).name.lower()
+    if executable in BLOCKED_EXECUTABLES:
+        raise ContractError(f"{where}.argv uses blocked executable {executable!r}; run side effects through the host directly")
+    if executable.startswith(("python", "node", "ruby", "perl")) and any(flag in INLINE_CODE_FLAGS for flag in argv[1:]):
+        raise ContractError(f"{where}.argv may not use inline interpreter code")
+    risk = raw.get("risk", "workspace-local")
+    if risk not in {"workspace-local", "network", "external-side-effect"}:
+        raise ContractError(f"{where}.risk is invalid")
+    if risk != "workspace-local" and risk not in allowed_risks:
+        raise ContractError(f"{where}.risk={risk!r} requires matching --allow-risk")
+    cwd_value = raw.get("cwd", ".")
+    if not isinstance(cwd_value, str) or not cwd_value:
+        raise ContractError(f"{where}.cwd must be a relative path string")
+    cwd = (root / cwd_value).resolve()
+    try:
+        cwd.relative_to(root)
+    except ValueError as exc:
+        raise ContractError(f"{where}.cwd escapes the repository root") from exc
+    if not cwd.is_dir():
+        raise ContractError(f"{where}.cwd does not exist: {cwd_value}")
+    timeout = raw.get("timeout_seconds", 300)
+    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 0.05 <= timeout <= 3600:
+        raise ContractError(f"{where}.timeout_seconds must be between 0.05 and 3600")
+    expected_exit = raw.get("expected_exit", 0)
+    if not isinstance(expected_exit, int) or isinstance(expected_exit, bool):
+        raise ContractError(f"{where}.expected_exit must be an integer")
+    patterns = raw.get("output_must_match", [])
+    if not isinstance(patterns, list) or not all(isinstance(pattern, str) for pattern in patterns):
+        raise ContractError(f"{where}.output_must_match must be a string array")
+    for pattern in patterns:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ContractError(f"{where}.output_must_match contains invalid regex: {exc}") from exc
+    return {
+        "id": check_id,
+        "description": description.strip(),
+        "argv": argv,
+        "cwd": cwd,
+        "cwd_display": cwd_value,
+        "timeout_seconds": float(timeout),
+        "expected_exit": expected_exit,
+        "output_must_match": patterns,
+        "risk": risk,
+    }
+
+
+def validate_manual(raw: Any, index: int) -> dict[str, Any]:
+    where = f"manual[{index}]"
+    if not isinstance(raw, dict):
+        raise ContractError(f"{where} must be an object")
+    criterion_id = validate_id(raw.get("id"), where)
+    description = raw.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise ContractError(f"{where}.description must be a non-empty string")
+    status = raw.get("status", "open")
+    if status not in {"open", "attested"}:
+        raise ContractError(f"{where}.status must be open or attested")
+    if status == "attested" and (not raw.get("attested_by") or not raw.get("evidence")):
+        raise ContractError(f"{where} attestation requires attested_by and evidence")
+    return {**raw, "id": criterion_id, "description": description.strip(), "status": status}
+
+
+def execute_check(check: dict[str, Any]) -> dict[str, Any]:
+    started = time.monotonic()
+    started_at = utc_now()
+    try:
+        result = subprocess.run(
+            check["argv"],
+            cwd=check["cwd"],
+            text=True,
+            capture_output=True,
+            timeout=check["timeout_seconds"],
+            check=False,
+            env=os.environ.copy(),
+        )
+        stdout, stdout_truncated = bounded(result.stdout)
+        stderr, stderr_truncated = bounded(result.stderr)
+        combined = stdout + "\n" + stderr
+        missing_patterns = [pattern for pattern in check["output_must_match"] if re.search(pattern, combined) is None]
+        passed = result.returncode == check["expected_exit"] and not missing_patterns
+        terminal = "pass" if passed else "fail"
+        returncode: int | None = result.returncode
+        error = None
+    except subprocess.TimeoutExpired as exc:
+        stdout, stdout_truncated = bounded(exc.stdout or "")
+        stderr, stderr_truncated = bounded(exc.stderr or "")
+        missing_patterns = check["output_must_match"]
+        passed = False
+        terminal = "timeout"
+        returncode = None
+        error = f"timeout after {check['timeout_seconds']} seconds"
+    duration_ms = round((time.monotonic() - started) * 1000)
+    return {
+        "id": check["id"],
+        "description": check["description"],
+        "argv": check["argv"],
+        "cwd": check["cwd_display"],
+        "risk": check["risk"],
+        "started_at": started_at,
+        "duration_ms": duration_ms,
+        "returncode": returncode,
+        "expected_exit": check["expected_exit"],
+        "missing_output_patterns": missing_patterns,
+        "stdout": stdout,
+        "stderr": stderr,
+        "output_truncated": stdout_truncated or stderr_truncated,
+        "terminal": terminal,
+        "error": error,
+        "passed": passed,
+    }
+
+
+def print_result(result: dict[str, Any]) -> None:
+    label = "PASS" if result["passed"] else result["terminal"].upper()
+    print(f"{label:<8} {result['description']} [{result['id']}]")
+    print("         $ " + " ".join(result["argv"]))
+    if result["stdout"]:
+        for line in result["stdout"].rstrip().splitlines():
+            print(f"         | {line}")
+    if result["stderr"]:
+        for line in result["stderr"].rstrip().splitlines():
+            print(f"         ! {line}")
+    if result["error"]:
+        print(f"         ! {result['error']}")
+    if result["missing_output_patterns"]:
+        print(f"         ! missing output patterns: {result['missing_output_patterns']}")
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        checks_path, episode, root = resolve_target(args.target)
+        contract = load_contract(checks_path)
+        allowed_risks = {"workspace-local", *args.allow_risk}
+        checks = [validate_check(raw, index, root, allowed_risks) for index, raw in enumerate(contract["checks"])]
+        manual = [validate_manual(raw, index) for index, raw in enumerate(contract["manual"])]
+    except ContractError as exc:
+        print(f"verify-contract: schema error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"verify-contract: {checks_path}")
+    print(f"repo root: {root}")
+    digest = "sha256:" + hashlib.sha256(checks_path.read_bytes()).hexdigest()
+    if args.dry_run:
+        for check in checks:
+            print(f"DRY-RUN  {check['description']} [{check['id']}]")
+            print("         $ " + " ".join(check["argv"]))
+        print(f"checks digest: {digest}")
+        return 0
+
+    evidence_dir = episode / "evidence"
+    evidence_dir.mkdir(mode=0o700, exist_ok=True)
+    results = []
+    for check in checks:
+        result = execute_check(check)
+        results.append(result)
+        print_result(result)
+        write_json(evidence_dir / f"check-{check['id']}.json", result)
+
+    manual_open = [criterion for criterion in manual if criterion["status"] != "attested"]
+    for criterion in manual:
+        label = "MANUAL ok" if criterion["status"] == "attested" else "MANUAL --"
+        print(f"{label:<9} {criterion['description']} [{criterion['id']}]")
+
+    passed = sum(1 for result in results if result["passed"])
+    failed = len(results) - passed
+    closeout_passed = failed == 0 and (args.allow_manual_open or not manual_open)
+    grading = {
+        "schema": "workloop-grading/1",
+        "graded_at": utc_now(),
+        "checks_digest": digest,
+        "summary": {
+            "auto_pass": passed,
+            "auto_fail": failed,
+            "manual_attested": len(manual) - len(manual_open),
+            "manual_open": len(manual_open),
+            "passed": closeout_passed,
+        },
+        "results": results,
+        "manual": manual,
+    }
+    write_json(evidence_dir / "grading.json", grading)
+    print(
+        "summary: "
+        f"{passed} auto pass, {failed} auto fail, "
+        f"{len(manual) - len(manual_open)} manual attested, {len(manual_open)} manual open"
+    )
+    if closeout_passed:
+        print("result: PASS" if not manual_open else "result: PASS (manual criteria explicitly allowed open)")
+        return 0
+    if manual_open and failed == 0:
+        print("result: FAIL — manual criteria remain open; close-out is strict by default")
+    else:
+        print("result: FAIL")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

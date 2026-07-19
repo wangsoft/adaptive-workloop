@@ -1,0 +1,64 @@
+{
+  "suite": "adaptive-workloop/standalone",
+  "version": "0.2.1",
+  "required_host_profile": "codex-standalone",
+  "purpose": "Prove that the candidate can execute every route without optional specialist Skills.",
+  "cases": [
+    {
+      "id": "s-001",
+      "title": "Explicit trivial edit stays Direct",
+      "setup": {
+        "task": "Use adaptive-workloop to fix one typo in a private Markdown file. The diff itself is sufficient proof.",
+        "explicit_invocation": true
+      },
+      "expected": {
+        "route": "direct",
+        "terminal": "complete",
+        "degradation": null,
+        "required_artifacts": []
+      }
+    },
+    {
+      "id": "s-002",
+      "title": "Tested bug fix uses host-native Verified fallback",
+      "setup": {
+        "task": "Fix an isolated pagination bug in a repository with a deterministic unit test command.",
+        "deterministic_checks": true
+      },
+      "expected": {
+        "route": "verified",
+        "terminal": "complete",
+        "degradation": "host-native-verified",
+        "required_artifacts": ["evidence/grading.json"]
+      }
+    },
+    {
+      "id": "s-003",
+      "title": "High-risk work without verifier stops at human boundary",
+      "setup": {
+        "task": "Modify authentication token refresh behavior and prepare the safest reversible result.",
+        "high_risk": true
+      },
+      "expected": {
+        "route": "reviewed",
+        "terminal": "needs_human",
+        "degradation": "labeled-self-review",
+        "required_artifacts": ["review.md"]
+      }
+    },
+    {
+      "id": "s-004",
+      "title": "Multi-session work uses durable serial execution",
+      "setup": {
+        "task": "Implement a reporting module across several sessions when no child agents are available.",
+        "multi_session": true
+      },
+      "expected": {
+        "route": "distributed",
+        "terminal": "complete",
+        "degradation": "durable-serial",
+        "required_artifacts": ["state.json", "progress.md"]
+      }
+    }
+  ]
+}

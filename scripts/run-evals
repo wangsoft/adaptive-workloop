@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""Validate eval suites and run provider-neutral adapter trials."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+SUITES = ("trigger", "behavior", "regression", "standalone")
+ROUTES = {None, "direct", "verified", "reviewed", "distributed"}
+HOST_PROFILE_FIELDS = {
+    "subagents",
+    "browser",
+    "context_budget",
+    "effort_mode",
+    "permission_mode",
+    "native_orchestration",
+    "installed_skills",
+}
+
+
+class EvalError(ValueError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--validate", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--suite", choices=SUITES)
+    parser.add_argument("--case", action="append", default=[])
+    parser.add_argument("--adapter", type=Path)
+    parser.add_argument(
+        "--condition", choices=("candidate", "previous", "bare"), default="candidate"
+    )
+    parser.add_argument("--model-profile", default="unspecified")
+    parser.add_argument(
+        "--host-profile",
+        help="built-in profile id or path to a workloop-capabilities/1 manifest",
+    )
+    parser.add_argument("--trials", type=int, default=1)
+    parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument("--output", type=Path)
+    return parser.parse_args()
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EvalError(f"{path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise EvalError(f"{path}: root must be an object")
+    return value
+
+
+def validate_common(
+    path: Path, value: dict[str, Any], suite: str
+) -> list[dict[str, Any]]:
+    cases = value.get("cases")
+    if not isinstance(cases, list) or not cases:
+        raise EvalError(f"{path}: cases must be a non-empty array")
+    ids: set[str] = set()
+    for index, case in enumerate(cases):
+        if not isinstance(case, dict) or not isinstance(case.get("id"), str):
+            raise EvalError(f"{path}: cases[{index}] needs a string id")
+        if case["id"] in ids:
+            raise EvalError(f"{path}: duplicate case id {case['id']}")
+        ids.add(case["id"])
+    if value.get("suite") != f"adaptive-workloop/{suite}":
+        raise EvalError(f"{path}: suite label mismatch")
+    return cases
+
+
+def validate_suite(path: Path, suite: str) -> dict[str, Any]:
+    value = load_json(path)
+    cases = validate_common(path, value, suite)
+    if suite == "trigger":
+        for case in cases:
+            if not isinstance(case.get("prompt"), str) or not isinstance(
+                case.get("should_trigger"), bool
+            ):
+                raise EvalError(
+                    f"{path}: trigger case {case['id']} needs prompt and boolean should_trigger"
+                )
+            if case.get("expected_route") not in ROUTES:
+                raise EvalError(
+                    f"{path}: trigger case {case['id']} has invalid expected_route"
+                )
+        positives = sum(case["should_trigger"] for case in cases)
+        negatives = len(cases) - positives
+        if positives < 8 or negatives < 8:
+            raise EvalError(
+                f"{path}: trigger suite needs at least 8 positive and 8 near-miss negative cases"
+            )
+    elif suite == "standalone":
+        if not isinstance(value.get("required_host_profile"), str):
+            raise EvalError(f"{path}: standalone suite needs required_host_profile")
+        seen_routes = set()
+        for case in cases:
+            if not isinstance(case.get("setup"), dict) or not isinstance(
+                case.get("expected"), dict
+            ):
+                raise EvalError(
+                    f"{path}: case {case['id']} needs setup and expected objects"
+                )
+            expected = case["expected"]
+            route = expected.get("route")
+            if route not in ROUTES - {None}:
+                raise EvalError(
+                    f"{path}: standalone case {case['id']} has invalid route"
+                )
+            if expected.get("terminal") not in {"complete", "needs_human"}:
+                raise EvalError(
+                    f"{path}: standalone case {case['id']} has invalid terminal"
+                )
+            artifacts = expected.get("required_artifacts")
+            if not isinstance(artifacts, list) or not all(
+                isinstance(item, str) and item for item in artifacts
+            ):
+                raise EvalError(
+                    f"{path}: standalone case {case['id']} needs string required_artifacts"
+                )
+            seen_routes.add(route)
+        if seen_routes != ROUTES - {None}:
+            raise EvalError(
+                f"{path}: standalone suite must cover every route exactly or repeatedly"
+            )
+    else:
+        if value.get("held_out") is True:
+            raise EvalError(
+                f"{path}: public repository cases are regression tests, not held-out evidence"
+            )
+        for case in cases:
+            if not isinstance(case.get("setup"), dict) or not isinstance(
+                case.get("expected"), dict
+            ):
+                raise EvalError(
+                    f"{path}: case {case['id']} needs setup and expected objects"
+                )
+    return value
+
+
+def suite_paths(root: Path) -> dict[str, Path]:
+    return {suite: root / "evals" / f"{suite}-cases.json" for suite in SUITES}
+
+
+def validate_all(root: Path) -> dict[str, dict[str, Any]]:
+    validated = {}
+    for suite, path in suite_paths(root).items():
+        validated[suite] = validate_suite(path, suite)
+        print(f"validate {suite}: PASS ({len(validated[suite]['cases'])} cases)")
+    profile_ids = set()
+    for path in sorted((root / "evals" / "profiles").glob("*.json")):
+        profile = validate_host_profile(path)
+        profile_ids.add(profile["profile_id"])
+        print(f"validate profile {profile['profile_id']}: PASS")
+    for suite, value in validated.items():
+        required = value.get("required_host_profile")
+        if required and required not in profile_ids:
+            raise EvalError(f"suite {suite} requires missing host profile {required}")
+    return validated
+
+
+def validate_host_profile(path: Path) -> dict[str, Any]:
+    value = load_json(path)
+    if value.get("schema") != "workloop-capabilities/1":
+        raise EvalError(f"{path}: host profile schema must be workloop-capabilities/1")
+    if not isinstance(value.get("profile_id"), str) or not value["profile_id"]:
+        raise EvalError(f"{path}: host profile needs profile_id")
+    missing = HOST_PROFILE_FIELDS - value.keys()
+    if missing:
+        raise EvalError(f"{path}: host profile missing fields: {sorted(missing)}")
+    skills = value.get("installed_skills")
+    if not isinstance(skills, list) or not all(
+        isinstance(item, str) for item in skills
+    ):
+        raise EvalError(f"{path}: installed_skills must be a string array")
+    if not isinstance(value.get("subagents"), bool) or not isinstance(
+        value.get("browser"), bool
+    ):
+        raise EvalError(f"{path}: subagents and browser must be booleans")
+    return value
+
+
+def load_host_profile(root: Path, requested: str | None) -> dict[str, Any] | None:
+    if requested is None:
+        return None
+    supplied = Path(requested)
+    path = (
+        supplied
+        if supplied.is_file()
+        else root / "evals" / "profiles" / f"{requested}.json"
+    )
+    if not path.is_file():
+        raise EvalError(f"host profile not found: {requested}")
+    capabilities = validate_host_profile(path)
+    return {
+        "id": capabilities["profile_id"],
+        "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+        "capabilities": capabilities,
+    }
+
+
+def case_prompt(suite: str, case: dict[str, Any]) -> str:
+    if suite == "trigger":
+        return case["prompt"]
+    setup = case["setup"]
+    return str(
+        setup.get("task") or setup.get("prompt") or case.get("title") or case["id"]
+    )
+
+
+def request_for(
+    root: Path,
+    suite: str,
+    case: dict[str, Any],
+    condition: str,
+    model_profile: str,
+    host_profile: dict[str, Any] | None,
+    trial: int,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "schema": "workloop-adapter-request/1",
+        "suite": suite,
+        "case_id": case["id"],
+        "trial": trial,
+        "condition": condition,
+        "model_profile": model_profile,
+        "host_profile": host_profile,
+        "prompt": case_prompt(suite, case),
+        "setup": case.get("setup", {}),
+        "skill": None,
+    }
+    if condition == "candidate":
+        request["skill"] = {"name": "adaptive-workloop", "path": str(root)}
+    elif condition == "previous":
+        request["skill"] = {
+            "name": "adaptive-workloop",
+            "path": None,
+            "source": "adapter-configured previous",
+        }
+    return request
+
+
+def grade_trigger(
+    case: dict[str, Any], condition: str, response: dict[str, Any]
+) -> dict[str, Any]:
+    activated = response.get("activated")
+    route = response.get("route")
+    expected_activation = case["should_trigger"] if condition != "bare" else False
+    activation_pass = activated is expected_activation
+    route_expected = case.get("expected_route") if expected_activation else None
+    route_pass = route_expected is None or route == route_expected
+    return {
+        "schema": "workloop-eval-grading/1",
+        "status": "passed" if activation_pass and route_pass else "failed",
+        "activation": {
+            "expected": expected_activation,
+            "actual": activated,
+            "passed": activation_pass,
+        },
+        "route": {"expected": route_expected, "actual": route, "passed": route_pass},
+    }
+
+
+def grade_standalone(case: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    expected = case["expected"]
+    activated_pass = response.get("activated") is True
+    route_pass = response.get("route") == expected["route"]
+    terminal_pass = response.get("terminal") == expected["terminal"]
+    degradation_pass = response.get("degradation") == expected.get("degradation")
+
+    trace = response.get("trace")
+    skill_calls = trace.get("skill_calls") if isinstance(trace, dict) else None
+    trace_valid = isinstance(skill_calls, list) and all(
+        isinstance(item, str) for item in skill_calls
+    )
+    unavailable_skill_calls = (
+        [item for item in skill_calls if item != "adaptive-workloop"]
+        if trace_valid
+        else ["<invalid-trace>"]
+    )
+
+    artifacts = response.get("artifacts")
+    artifacts_valid = isinstance(artifacts, list) and all(
+        isinstance(item, str) for item in artifacts
+    )
+    missing_artifacts = []
+    if artifacts_valid:
+        missing_artifacts = [
+            required
+            for required in expected["required_artifacts"]
+            if not any(artifact.endswith(required) for artifact in artifacts)
+        ]
+    else:
+        missing_artifacts = list(expected["required_artifacts"])
+
+    passed = all(
+        (
+            activated_pass,
+            route_pass,
+            terminal_pass,
+            degradation_pass,
+            trace_valid,
+            not unavailable_skill_calls,
+            artifacts_valid,
+            not missing_artifacts,
+        )
+    )
+    return {
+        "schema": "workloop-eval-grading/1",
+        "status": "passed" if passed else "failed",
+        "activated": {
+            "expected": True,
+            "actual": response.get("activated"),
+            "passed": activated_pass,
+        },
+        "route": {
+            "expected": expected["route"],
+            "actual": response.get("route"),
+            "passed": route_pass,
+        },
+        "terminal": {
+            "expected": expected["terminal"],
+            "actual": response.get("terminal"),
+            "passed": terminal_pass,
+        },
+        "degradation": {
+            "expected": expected.get("degradation"),
+            "actual": response.get("degradation"),
+            "passed": degradation_pass,
+        },
+        "unavailable_skill_calls": unavailable_skill_calls,
+        "missing_artifacts": missing_artifacts,
+    }
+
+
+def run_adapter(
+    adapter: Path, request: dict[str, Any], timeout: float
+) -> tuple[dict[str, Any], str, float]:
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            [str(adapter)],
+            input=json.dumps(request),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except OSError as exc:
+        raise EvalError(f"adapter could not start: {exc}") from exc
+    duration = time.monotonic() - started
+    if result.returncode != 0:
+        raise EvalError(f"adapter exited {result.returncode}: {result.stderr.strip()}")
+    try:
+        response = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise EvalError(f"adapter returned invalid JSON: {exc}") from exc
+    if (
+        not isinstance(response, dict)
+        or response.get("schema") != "workloop-adapter-response/1"
+    ):
+        raise EvalError("adapter response must use schema workloop-adapter-response/1")
+    return response, result.stderr, duration
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def main() -> int:
+    args = parse_args()
+    root = Path(__file__).resolve().parent.parent
+    try:
+        suites = validate_all(root)
+    except EvalError as exc:
+        print(f"run-evals: {exc}", file=sys.stderr)
+        return 2
+    if args.validate and args.suite is None:
+        return 0
+    if args.suite is None:
+        print(
+            "run-evals: --suite is required unless only --validate is used",
+            file=sys.stderr,
+        )
+        return 2
+    if args.trials < 1:
+        print("run-evals: --trials must be positive", file=sys.stderr)
+        return 2
+
+    required_host_profile = suites[args.suite].get("required_host_profile")
+    requested_host_profile = args.host_profile or required_host_profile
+    try:
+        host_profile = load_host_profile(root, requested_host_profile)
+    except EvalError as exc:
+        print(f"run-evals: {exc}", file=sys.stderr)
+        return 2
+    if required_host_profile and (
+        host_profile is None or host_profile["id"] != required_host_profile
+    ):
+        print(
+            f"run-evals: suite {args.suite} requires host profile {required_host_profile}",
+            file=sys.stderr,
+        )
+        return 2
+
+    selected = suites[args.suite]["cases"]
+    if args.case:
+        wanted = set(args.case)
+        selected = [case for case in selected if case["id"] in wanted]
+        missing = wanted - {case["id"] for case in selected}
+        if missing:
+            print(f"run-evals: unknown cases: {sorted(missing)}", file=sys.stderr)
+            return 2
+    requests = [
+        request_for(
+            root,
+            args.suite,
+            case,
+            args.condition,
+            args.model_profile,
+            host_profile,
+            trial,
+        )
+        for case in selected
+        for trial in range(1, args.trials + 1)
+    ]
+    if args.dry_run or args.adapter is None:
+        for request in requests:
+            print(json.dumps(request, sort_keys=True))
+        if args.adapter is None and not args.dry_run:
+            print(
+                "run-evals: no adapter supplied; emitted dry-run requests only",
+                file=sys.stderr,
+            )
+        return 0
+
+    output = args.output or root / "evals" / "runs" / datetime.now(
+        timezone.utc
+    ).strftime("%Y%m%d-%H%M%S")
+    if output.exists() and any(output.iterdir()):
+        print(f"run-evals: output directory is not empty: {output}", file=sys.stderr)
+        return 2
+    output.mkdir(parents=True, exist_ok=True)
+    summary_cases = []
+    passed = failed = review_required = errors = 0
+    for index, (case, request) in enumerate(
+        (
+            (
+                case,
+                request_for(
+                    root,
+                    args.suite,
+                    case,
+                    args.condition,
+                    args.model_profile,
+                    host_profile,
+                    trial,
+                ),
+            )
+            for case in selected
+            for trial in range(1, args.trials + 1)
+        ),
+        start=1,
+    ):
+        artifact_id = f"case-{index:03d}"
+        case_dir = output / "cases" / artifact_id
+        case_dir.mkdir(parents=True)
+        write_json(case_dir / "request.json", request)
+        try:
+            response, stderr, duration = run_adapter(
+                args.adapter, request, args.timeout
+            )
+            write_json(case_dir / "response.json", response)
+            (case_dir / "adapter.stderr.txt").write_text(stderr, encoding="utf-8")
+            if args.suite == "trigger":
+                grading = grade_trigger(case, args.condition, response)
+                if grading["status"] == "passed":
+                    passed += 1
+                else:
+                    failed += 1
+            elif args.suite == "standalone":
+                grading = grade_standalone(case, response)
+                if grading["status"] == "passed":
+                    passed += 1
+                else:
+                    failed += 1
+            else:
+                grading = {
+                    "schema": "workloop-eval-grading/1",
+                    "status": "review_required",
+                    "reason": "behavior and regression outputs require an independent grader",
+                }
+                review_required += 1
+            write_json(case_dir / "grading.json", grading)
+            summary_cases.append(
+                {
+                    "artifact_id": artifact_id,
+                    "case_id": case["id"],
+                    "trial": request["trial"],
+                    "status": grading["status"],
+                    "duration_seconds": round(duration, 3),
+                    "usage": response.get("usage", {}),
+                }
+            )
+        except (EvalError, subprocess.TimeoutExpired) as exc:
+            errors += 1
+            (case_dir / "error.txt").write_text(str(exc) + "\n", encoding="utf-8")
+            summary_cases.append(
+                {"artifact_id": artifact_id, "case_id": case["id"], "status": "error"}
+            )
+
+    summary = {
+        "schema": "workloop-eval-summary/1",
+        "suite": args.suite,
+        "condition": args.condition,
+        "model_profile": args.model_profile,
+        "host_profile": (
+            {"id": host_profile["id"], "digest": host_profile["digest"]}
+            if host_profile
+            else None
+        ),
+        "trials": args.trials,
+        "total": len(summary_cases),
+        "passed": passed,
+        "failed": failed,
+        "review_required": review_required,
+        "errors": errors,
+        "cases": summary_cases,
+    }
+    write_json(output / "summary.json", summary)
+    print(f"run-evals: {output}")
+    print(
+        f"summary: {passed} passed, {failed} failed, {review_required} review required, {errors} errors"
+    )
+    return 1 if failed or errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Create a bounded adaptive-workloop episode package."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+ROUTES = ("verified", "reviewed", "distributed")
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+MANAGED_IGNORE = """# adaptive-workloop managed runtime state
+local/
+tracked/*/runtime.json
+tracked/*/capabilities.json
+tracked/*/evidence/
+"""
+
+
+def die(message: str) -> "NoReturn":
+    print(f"create-episode: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def run(*argv: str, cwd: Path) -> str:
+    result = subprocess.run(
+        argv,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def timestamp(value: datetime) -> str:
+    return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def slugify(task: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", task.lower()).strip("-")[:24].rstrip("-")
+    return slug or "task"
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def package_digest(skill_dir: Path) -> str:
+    digest = hashlib.sha256()
+    included = [skill_dir / "SKILL.md"]
+    for directory in ("scripts", "references", "assets"):
+        included.extend(sorted((skill_dir / directory).glob("*")))
+    for path in included:
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        digest.update(path.relative_to(skill_dir).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def skill_version(skill_md: Path) -> str:
+    text = skill_md.read_text(encoding="utf-8")
+    match = re.search(r'^\s*version:\s*["\']?([^"\'\n]+)', text, re.MULTILINE)
+    return match.group(1).strip() if match else "unknown"
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def render_template(source: Path, destination: Path, replacements: dict[str, str]) -> None:
+    content = source.read_text(encoding="utf-8")
+    for marker, value in replacements.items():
+        content = content.replace("{{" + marker + "}}", value)
+    destination.write_text(content, encoding="utf-8")
+
+
+def ensure_ignore_file(path: Path) -> None:
+    if not path.exists() or path.read_text(encoding="utf-8").strip() == "*":
+        path.write_text(MANAGED_IGNORE, encoding="utf-8")
+        return
+    current = path.read_text(encoding="utf-8")
+    if "# adaptive-workloop managed runtime state" not in current:
+        path.write_text(current.rstrip() + "\n\n" + MANAGED_IGNORE, encoding="utf-8")
+
+
+def load_capabilities(path: Path | None) -> dict[str, Any] | None:
+    raw = os.environ.get("WORKLOOP_CAPABILITIES_JSON")
+    if path is not None:
+        raw = path.read_text(encoding="utf-8")
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        die(f"invalid capability manifest JSON: {exc}")
+    if not isinstance(value, dict):
+        die("capability manifest must be a JSON object")
+    return value
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--task", required=True, help="one-line desired outcome")
+    parser.add_argument("--route", required=True, choices=ROUTES)
+    parser.add_argument("--model", default=os.environ.get("WORKLOOP_MODEL", "unknown"))
+    parser.add_argument("--slug")
+    parser.add_argument("--dir", dest="root", type=Path)
+    parser.add_argument("--storage", choices=("auto", "local", "tracked"), default="auto")
+    parser.add_argument("--capabilities", type=Path)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if "\n" in args.task or "\r" in args.task:
+        die("--task must be a single line")
+    if not args.task.strip():
+        die("--task must not be empty")
+
+    slug = args.slug or slugify(args.task)
+    if not SLUG_RE.fullmatch(slug):
+        die("--slug must match ^[a-z0-9][a-z0-9-]{0,31}$")
+
+    root = (args.root or Path(run("git", "rev-parse", "--show-toplevel", cwd=Path.cwd()) or Path.cwd())).resolve()
+    if not root.is_dir():
+        die(f"root directory not found: {root}")
+
+    storage = args.storage
+    if storage == "auto":
+        storage = "tracked" if args.route == "distributed" else "local"
+
+    skill_dir = Path(__file__).resolve().parent.parent
+    assets_dir = skill_dir / "assets"
+    required_assets = [assets_dir / name for name in ("contract.md", "progress.md", "handoff.md", "checks.json")]
+    missing = [str(path) for path in required_assets if not path.is_file()]
+    if missing:
+        die("missing assets: " + ", ".join(missing))
+
+    workloop = root / ".workloop"
+    workloop.mkdir(mode=0o700, exist_ok=True)
+    ignore_file = workloop / ".gitignore"
+    ensure_ignore_file(ignore_file)
+
+    now = utc_now()
+    base_id = f"{now.strftime('%Y%m%d-%H%M%S')}-{slug}"
+    episode_root = (workloop / storage).resolve()
+    episode_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    episode = episode_root / base_id
+    suffix = 1
+    while episode.exists():
+        episode = episode_root / f"{base_id}-{suffix}"
+        suffix += 1
+    episode.mkdir(mode=0o700)
+    (episode / "evidence").mkdir(mode=0o700)
+
+    probe = skill_dir / "scripts" / "probe-capabilities"
+    probe_argv = [str(probe), str(root)]
+    if args.capabilities is not None:
+        probe_argv.extend(["--capabilities", str(args.capabilities)])
+    runtime_result = subprocess.run(
+        probe_argv,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    try:
+        runtime = json.loads(runtime_result.stdout) if runtime_result.returncode == 0 else {}
+    except json.JSONDecodeError:
+        runtime = {}
+    if not runtime:
+        runtime = {"schema": "workloop-probe/2", "error": "probe failed"}
+    write_json(episode / "runtime.json", runtime)
+
+    capabilities = load_capabilities(args.capabilities)
+    capability_digest: str | None = None
+    if capabilities is not None:
+        write_json(episode / "capabilities.json", capabilities)
+        capability_digest = "sha256:" + file_sha256(episode / "capabilities.json")
+
+    inside_git = run("git", "rev-parse", "--is-inside-work-tree", cwd=root) == "true"
+    branch = run("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=root) if inside_git else None
+    head = run("git", "rev-parse", "HEAD", cwd=root) if inside_git else None
+    status_text = run("git", "status", "--porcelain=v1", cwd=root) if inside_git else ""
+    repo_state_digest = hashlib.sha256(status_text.encode()).hexdigest()
+
+    created_at = timestamp(now)
+    episode_id = episode.name
+    manifest = {
+        "schema": "workloop-episode/2",
+        "episode_id": episode_id,
+        "created_at": created_at,
+        "task": args.task.strip(),
+        "route": args.route,
+        "storage": storage,
+        "model": {"id": args.model or "unknown", "source": "self-report"},
+        "host": runtime.get("host", {"name": "unknown"}),
+        "skill": {
+            "name": "adaptive-workloop",
+            "version": skill_version(skill_dir / "SKILL.md"),
+            "digest": "sha256:" + package_digest(skill_dir),
+        },
+        "repo": {
+            "root": ".",
+            "branch": branch,
+            "head": head,
+            "dirty_files": len(status_text.splitlines()) if status_text else 0,
+            "state_digest": "sha256:" + repo_state_digest,
+        },
+        "runtime_probe_digest": "sha256:" + file_sha256(episode / "runtime.json"),
+        "capability_manifest_digest": capability_digest,
+    }
+    write_json(episode / "manifest.json", manifest)
+    write_json(
+        episode / "state.json",
+        {"schema": "workloop-state/1", "status": "open", "updated_at": created_at, "last_event_seq": 1},
+    )
+    event = {
+        "schema": "workloop-event/1",
+        "seq": 1,
+        "at": created_at,
+        "kind": "episode.created",
+        "status": "open",
+    }
+    (episode / "events.jsonl").write_text(json.dumps(event, sort_keys=True) + "\n", encoding="utf-8")
+    (episode / "checks.json").write_bytes((assets_dir / "checks.json").read_bytes())
+
+    replacements = {
+        "TASK": args.task.strip(),
+        "ROUTE": args.route,
+        "EPISODE_ID": episode_id,
+        "DATE": created_at,
+        "EPISODE_PATH": episode.relative_to(root).as_posix(),
+    }
+    for name in ("contract.md", "progress.md", "handoff.md"):
+        render_template(assets_dir / name, episode / name, replacements)
+
+    print(f"Episode created: {episode}")
+    print("  manifest.json  state.json  events.jsonl  runtime.json")
+    print("  contract.md  checks.json  progress.md  handoff.md  evidence/")
+    print("Next: fill contract.md and checks.json BEFORE the first edit")
+    print(f"Verify later with: {skill_dir / 'scripts' / 'verify-contract'} {episode}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

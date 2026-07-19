@@ -1,0 +1,7 @@
+interface:
+  display_name: "Adaptive Workloop"
+  short_description: "Route complex engineering work by risk"
+  default_prompt: "Use $adaptive-workloop to choose and run the smallest verifiable workflow for this engineering task."
+
+policy:
+  allow_implicit_invocation: true

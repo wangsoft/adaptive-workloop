@@ -1,0 +1,133 @@
+{
+  "suite": "adaptive-workloop/trigger",
+  "version": "0.2.0",
+  "how_to_run": "Give each prompt to a fresh agent session in a host with this skill installed alongside its normal skill set. Grade: (1) skill activation equals should_trigger; (2) when expected_route is non-null, the first announced route matches. Near-miss negatives matter as much as positives — over-triggering on Q&A is a failure.",
+  "cases": [
+    {
+      "id": "t-001",
+      "prompt": "Fix the typo in the login button label",
+      "should_trigger": false,
+      "expected_route": null,
+      "notes": "A one-step edit should stay on the host's ordinary fast path. Direct remains available after explicit invocation."
+    },
+    {
+      "id": "t-002",
+      "prompt": "Add rate limiting to our public API endpoints",
+      "should_trigger": true,
+      "expected_route": "reviewed",
+      "notes": "Public API = high-risk signal."
+    },
+    {
+      "id": "t-003",
+      "prompt": "Refactor the payments retry logic, tests exist",
+      "should_trigger": true,
+      "expected_route": "reviewed",
+      "notes": "Payments = high-risk signal even with good tests."
+    },
+    {
+      "id": "t-004",
+      "prompt": "Rename getUser to fetchUser across the repo, about 200 call sites",
+      "should_trigger": true,
+      "expected_route": "verified",
+      "notes": "Mechanical, type-checkable, single session. Distributed only if verification per-slice is genuinely needed."
+    },
+    {
+      "id": "t-005",
+      "prompt": "Build the CSV importer feature. It will take several days and must survive restarts of our sessions.",
+      "should_trigger": true,
+      "expected_route": "distributed",
+      "notes": "Horizon beyond one session stated explicitly."
+    },
+    {
+      "id": "t-006",
+      "prompt": "帮我把这个 bug 修一下，顺便决定要不要走完整流程",
+      "should_trigger": true,
+      "expected_route": null,
+      "notes": "Route depends on probe + classification; the ask is literally this skill's job."
+    },
+    {
+      "id": "t-007",
+      "prompt": "Debug why the nightly job runs out of memory",
+      "should_trigger": true,
+      "expected_route": null,
+      "notes": "Execution task; diagnosis phase may be delegated to an installed debugging skill."
+    },
+    {
+      "id": "t-008",
+      "prompt": "Migrate the users table to the new schema on production",
+      "should_trigger": true,
+      "expected_route": "reviewed",
+      "notes": "Data migration + prod = high risk, irreversible; verifier and explicit approval required."
+    },
+    {
+      "id": "t-009",
+      "prompt": "Explain how OAuth PKCE works",
+      "should_trigger": false,
+      "expected_route": null,
+      "notes": "Pure Q&A. Near-miss: mentions a technical topic but there is no work to route."
+    },
+    {
+      "id": "t-010",
+      "prompt": "Write a blog post announcing our launch",
+      "should_trigger": false,
+      "expected_route": null,
+      "notes": "Prose-only writing; out of scope by description."
+    },
+    {
+      "id": "t-011",
+      "prompt": "What's the difference between a git worktree and a clone?",
+      "should_trigger": false,
+      "expected_route": null,
+      "notes": "Q&A near-miss using this skill's own vocabulary."
+    },
+    {
+      "id": "t-012",
+      "prompt": "Review PR #142 for me",
+      "should_trigger": false,
+      "expected_route": null,
+      "notes": "Standalone review request routes to a dedicated review skill; the workloop routes work it is about to execute."
+    },
+    {
+      "id": "t-013",
+      "prompt": "Resume the workloop episode from yesterday",
+      "should_trigger": true,
+      "expected_route": null,
+      "notes": "Explicit resume; must follow the resume protocol (manifest → progress → contract → re-verify)."
+    },
+    {
+      "id": "t-014",
+      "prompt": "这个任务怎么开工？该用多重的流程？",
+      "should_trigger": true,
+      "expected_route": null,
+      "notes": "Direct ask for process routing, Chinese phrasing from the description."
+    },
+    {
+      "id": "t-015",
+      "prompt": "Fix the failing parser unit test; the failure points to one assertion",
+      "should_trigger": false,
+      "expected_route": null,
+      "notes": "Ordinary isolated bug fix belongs to the host's debugging/TDD path unless risk or coordination grows."
+    },
+    {
+      "id": "t-016",
+      "prompt": "Add the missing return type annotation in src/format.ts",
+      "should_trigger": false,
+      "expected_route": null,
+      "notes": "One-step deterministic edit."
+    },
+    {
+      "id": "t-017",
+      "prompt": "Run the existing tests and tell me whether they pass",
+      "should_trigger": false,
+      "expected_route": null,
+      "notes": "A bounded diagnostic command does not need process routing."
+    },
+    {
+      "id": "t-018",
+      "prompt": "Review this implementation plan and point out gaps",
+      "should_trigger": false,
+      "expected_route": null,
+      "notes": "Standalone review should route to a dedicated review skill."
+    }
+  ]
+}

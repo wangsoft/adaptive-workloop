@@ -1,0 +1,30 @@
+{
+  "schema": "workloop-results/1",
+  "runs": [
+    {
+      "date": "2026-07-18",
+      "id": "deterministic-candidate-0.2.1",
+      "kind": "deterministic-package",
+      "results": {
+        "unit_tests": "20/20 passed",
+        "trigger_schema": "18 cases validated (9 positive, 9 negative)",
+        "behavior_schema": "11 cases validated",
+        "public_regression_schema": "10 cases validated",
+        "standalone_conformance": "4/4 fixture trials passed with codex-standalone profile",
+        "agent_skills_spec": "skills-ref 0.1.5 passed",
+        "ruff": "passed"
+      },
+      "limits": "No real-model bare/previous/candidate behavior trials were run. Standalone conformance used a deterministic fixture adapter, so this is package and control evidence only."
+    }
+  ],
+  "real_model_matrix": {
+    "status": "pending",
+    "required_profiles": [
+      "claude-fable-5 plus host and effort",
+      "gpt-5.6-sol plus host and effort",
+      "one lower-cost executor profile"
+    ],
+    "conditions": ["bare", "previous", "candidate"],
+    "minimum_trials_per_case": 3
+  }
+}
