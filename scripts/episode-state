@@ -13,6 +13,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.dont_write_bytecode = True
+from workloop_core import scan_tracked_episode  # noqa: E402
+
 
 STATUSES = ("open", "in_progress", "blocked", "verified", "complete", "cancelled")
 TRANSITIONS = {
@@ -52,8 +55,69 @@ def load_json(path: Path) -> dict[str, Any]:
 
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     temporary = path.with_name(path.name + f".tmp-{os.getpid()}")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def load_events(path: Path, episode_id: str | None) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ValueError(f"cannot read {path.name}: {exc}") from exc
+    if not lines:
+        raise ValueError("events.jsonl must contain at least one event")
+    events: list[dict[str, Any]] = []
+    previous_status: str | None = None
+    for index, line in enumerate(lines, start=1):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"events.jsonl line {index} is invalid JSON: {exc}"
+            ) from exc
+        if not isinstance(event, dict) or event.get("schema") != "workloop-event/1":
+            raise ValueError(f"events.jsonl line {index} has invalid schema")
+        if event.get("seq") != index:
+            raise ValueError(f"events.jsonl line {index} has non-contiguous sequence")
+        if event.get("status") not in TRANSITIONS:
+            raise ValueError(f"events.jsonl line {index} has invalid status")
+        recorded_episode = event.get("episode_id")
+        if recorded_episode is not None and recorded_episode != episode_id:
+            raise ValueError(f"events.jsonl line {index} belongs to another episode")
+        if index > 1 and event.get("from_status") != previous_status:
+            raise ValueError(f"events.jsonl line {index} breaks the status chain")
+        previous_status = event["status"]
+        events.append(event)
+    return events
+
+
+def reconcile_state(
+    state_path: Path, events_path: Path, state: dict[str, Any], episode_id: str | None
+) -> dict[str, Any]:
+    events = load_events(events_path, episode_id)
+    durable = events[-1]
+    durable_seq = durable["seq"]
+    if (
+        state.get("last_event_seq") != durable_seq
+        or state.get("status") != durable["status"]
+    ):
+        state.update(
+            {
+                "status": durable["status"],
+                "updated_at": durable.get("at"),
+                "last_event_seq": durable_seq,
+            }
+        )
+        atomic_write_json(state_path, state)
+    return state
 
 
 def main() -> int:
@@ -63,10 +127,15 @@ def main() -> int:
         print(f"episode-state: episode not found: {episode}", file=sys.stderr)
         return 2
     if not KIND_RE.fullmatch(args.kind):
-        print("episode-state: --kind must be a short dotted identifier", file=sys.stderr)
+        print(
+            "episode-state: --kind must be a short dotted identifier", file=sys.stderr
+        )
         return 2
     if "\n" in args.message or "\r" in args.message or len(args.message) > 500:
-        print("episode-state: --message must be one line and at most 500 characters", file=sys.stderr)
+        print(
+            "episode-state: --message must be one line and at most 500 characters",
+            file=sys.stderr,
+        )
         return 2
     manifest_path = episode / "manifest.json"
     state_path = episode / "state.json"
@@ -82,16 +151,36 @@ def main() -> int:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             state = load_json(state_path)
+            state = reconcile_state(
+                state_path,
+                events_path,
+                state,
+                manifest.get("episode_id"),
+            )
         except ValueError as exc:
             print(f"episode-state: {exc}", file=sys.stderr)
             return 2
         current = state.get("status")
         if current not in TRANSITIONS:
-            print(f"episode-state: invalid current status: {current!r}", file=sys.stderr)
+            print(
+                f"episode-state: invalid current status: {current!r}", file=sys.stderr
+            )
             return 2
         if args.status != current and args.status not in TRANSITIONS[current]:
-            print(f"episode-state: invalid transition {current} -> {args.status}", file=sys.stderr)
+            print(
+                f"episode-state: invalid transition {current} -> {args.status}",
+                file=sys.stderr,
+            )
             return 1
+        if args.status == "complete" and manifest.get("storage") == "tracked":
+            findings = scan_tracked_episode(episode)
+            if findings:
+                print(
+                    "episode-state: tracked episode failed redaction gate; "
+                    "run check-episode for redacted findings",
+                    file=sys.stderr,
+                )
+                return 1
 
         seq = int(state.get("last_event_seq", 0)) + 1
         now = utc_now()

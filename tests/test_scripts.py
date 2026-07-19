@@ -13,6 +13,7 @@ CREATE_EPISODE = ROOT / "scripts" / "create-episode"
 VERIFY_CONTRACT = ROOT / "scripts" / "verify-contract"
 EPISODE_STATE = ROOT / "scripts" / "episode-state"
 PROBE_CAPABILITIES = ROOT / "scripts" / "probe-capabilities"
+CHECK_EPISODE = ROOT / "scripts" / "check-episode"
 
 
 class CreateEpisodeTests(unittest.TestCase):
@@ -96,6 +97,11 @@ class CreateEpisodeTests(unittest.TestCase):
             self.assertEqual(checks["checks"], [])
             self.assertEqual(checks["manual"], [])
             self.assertTrue((episode / "events.jsonl").is_file())
+            first_event = json.loads(
+                (episode / "events.jsonl").read_text().splitlines()[0]
+            )
+            self.assertEqual(first_event["episode_id"], manifest["episode_id"])
+            self.assertIsNone(first_event["from_status"])
             self.assertIn(
                 "local/", (Path(tmp) / ".workloop" / ".gitignore").read_text()
             )
@@ -353,8 +359,227 @@ class EpisodeStateTests(unittest.TestCase):
             self.assertEqual(events[-1]["kind"], "work.started")
             self.assertEqual((episode / "manifest.json").read_bytes(), manifest_before)
 
+    def test_recovers_state_from_the_append_only_event_log_before_transitioning(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(
+                [
+                    str(CREATE_EPISODE),
+                    "--task",
+                    "recover durable state",
+                    "--route",
+                    "distributed",
+                    "--dir",
+                    tmp,
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            episode = next((root / ".workloop" / "tracked").iterdir())
+            subprocess.run(
+                [str(EPISODE_STATE), str(episode), "--status", "in_progress"],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            manifest = json.loads((episode / "manifest.json").read_text())
+            pending_event = {
+                "schema": "workloop-event/1",
+                "seq": 3,
+                "at": "2026-07-19T00:00:00Z",
+                "episode_id": manifest["episode_id"],
+                "kind": "worker.blocked",
+                "from_status": "in_progress",
+                "status": "blocked",
+                "message": "simulated crash after durable event append",
+                "evidence": [],
+            }
+            with (episode / "events.jsonl").open("a", encoding="utf-8") as events:
+                events.write(json.dumps(pending_event, sort_keys=True) + "\n")
+
+            result = subprocess.run(
+                [
+                    str(EPISODE_STATE),
+                    str(episode),
+                    "--status",
+                    "in_progress",
+                    "--kind",
+                    "work.resumed",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("blocked -> in_progress", result.stdout)
+            state = json.loads((episode / "state.json").read_text())
+            events = [
+                json.loads(line)
+                for line in (episode / "events.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(state["last_event_seq"], 4)
+            self.assertEqual(state["status"], "in_progress")
+            self.assertEqual([event["seq"] for event in events], [1, 2, 3, 4])
+
+    def test_tracked_episode_must_pass_redaction_gate_before_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(
+                [
+                    str(CREATE_EPISODE),
+                    "--task",
+                    "protect handoff evidence",
+                    "--route",
+                    "distributed",
+                    "--dir",
+                    tmp,
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            episode = next((root / ".workloop" / "tracked").iterdir())
+            for status in ("in_progress", "verified"):
+                subprocess.run(
+                    [str(EPISODE_STATE), str(episode), "--status", status],
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+            canary = "sk-" + "A" * 40
+            (episode / "handoff.md").write_text(
+                f"# Handoff\n\napi_key: {canary}\n", encoding="utf-8"
+            )
+
+            scan = subprocess.run(
+                [str(CHECK_EPISODE), str(episode)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            blocked = subprocess.run(
+                [str(EPISODE_STATE), str(episode), "--status", "complete"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(scan.returncode, 1, scan.stdout + scan.stderr)
+            self.assertNotIn(canary, scan.stdout + scan.stderr)
+            self.assertEqual(blocked.returncode, 1, blocked.stdout + blocked.stderr)
+            state = json.loads((episode / "state.json").read_text())
+            self.assertEqual(state["status"], "verified")
+
+            (episode / "handoff.md").write_text(
+                "# Handoff\n\napi_key: [REDACTED]\n", encoding="utf-8"
+            )
+            clean = subprocess.run(
+                [str(CHECK_EPISODE), str(episode)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            completed = subprocess.run(
+                [str(EPISODE_STATE), str(episode), "--status", "complete"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+            self.assertEqual(
+                completed.returncode, 0, completed.stdout + completed.stderr
+            )
+
+    def test_refuses_a_non_contiguous_event_log_without_mutating_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(
+                [
+                    str(CREATE_EPISODE),
+                    "--task",
+                    "reject corrupt journal",
+                    "--route",
+                    "distributed",
+                    "--dir",
+                    tmp,
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            episode = next((root / ".workloop" / "tracked").iterdir())
+            state_before = (episode / "state.json").read_bytes()
+            corrupt = {
+                "schema": "workloop-event/1",
+                "seq": 3,
+                "at": "2026-07-19T00:00:00Z",
+                "kind": "sequence.skipped",
+                "from_status": "open",
+                "status": "in_progress",
+            }
+            with (episode / "events.jsonl").open("a", encoding="utf-8") as events:
+                events.write(json.dumps(corrupt, sort_keys=True) + "\n")
+
+            result = subprocess.run(
+                [str(EPISODE_STATE), str(episode), "--status", "in_progress"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("non-contiguous sequence", result.stderr)
+            self.assertEqual((episode / "state.json").read_bytes(), state_before)
+
 
 class ProbeCapabilitiesTests(unittest.TestCase):
+    def test_repository_digest_changes_when_dirty_file_content_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "workloop@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Workloop Test"],
+                cwd=root,
+                check=True,
+            )
+            tracked = root / "tracked.txt"
+            tracked.write_text("baseline\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "baseline"], cwd=root, check=True
+            )
+
+            tracked.write_text("dirty version one\n", encoding="utf-8")
+            first = subprocess.run(
+                [str(PROBE_CAPABILITIES), str(root)],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            tracked.write_text("dirty version two\n", encoding="utf-8")
+            second = subprocess.run(
+                [str(PROBE_CAPABILITIES), str(root)],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            first_git = json.loads(first.stdout)["git"]
+            second_git = json.loads(second.stdout)["git"]
+            self.assertEqual(first_git["dirty_files"], second_git["dirty_files"])
+            self.assertNotEqual(first_git["state_digest"], second_git["state_digest"])
+            self.assertEqual(first_git["snapshot_schema"], "workloop-repo-snapshot/1")
+
     def test_codex_standalone_profile_is_complete_and_probeable(self) -> None:
         profile_path = ROOT / "evals" / "profiles" / "codex-standalone.json"
         profile = json.loads(profile_path.read_text())

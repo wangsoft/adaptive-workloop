@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Check the Git-visible surface of a durable episode for unsafe content."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+from workloop_core import scan_tracked_episode  # noqa: E402
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("episode", type=Path)
+    parser.add_argument("--json", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    episode = args.episode.resolve()
+    if not episode.is_dir():
+        print(f"check-episode: episode not found: {episode}", file=sys.stderr)
+        return 2
+    findings = scan_tracked_episode(episode)
+    if args.json:
+        print(
+            json.dumps(
+                {"schema": "workloop-episode-scan/1", "findings": findings},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    elif findings:
+        for finding in findings:
+            location = finding["path"]
+            if finding["line"] is not None:
+                location += f":{finding['line']}"
+            print(f"check-episode: {location}: {finding['rule']}", file=sys.stderr)
+    else:
+        print("check-episode: PASS")
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

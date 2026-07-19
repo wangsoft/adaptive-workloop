@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
@@ -12,9 +11,13 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+sys.dont_write_bytecode = True
+from workloop_core import repository_snapshot  # noqa: E402
 
 
 CAPABILITY_FIELDS = (
@@ -56,7 +59,10 @@ def host() -> dict[str, str]:
         return {"name": "github-actions", "evidence": "CI environment marker"}
     if env.get("GITLAB_CI"):
         return {"name": "gitlab-ci", "evidence": "CI environment marker"}
-    return {"name": "unknown", "evidence": "no supported host marker; self-report is allowed"}
+    return {
+        "name": "unknown",
+        "evidence": "no supported host marker; self-report is allowed",
+    }
 
 
 def runtime_version(executable: str, *args: str) -> str | None:
@@ -105,9 +111,15 @@ def verification_commands(root: Path) -> tuple[dict[str, str | None], list[str]]
             commands.setdefault("test", "make check")
         if targets.intersection({"test", "lint", "build", "typecheck", "check"}):
             evidence.append("Makefile targets")
-    if "test" not in commands and (
-        (root / "pytest.ini").is_file() or (root / "pyproject.toml").is_file() or (root / "tests").is_dir()
-    ) and importlib.util.find_spec("pytest") is not None:
+    if (
+        "test" not in commands
+        and (
+            (root / "pytest.ini").is_file()
+            or (root / "pyproject.toml").is_file()
+            or (root / "tests").is_dir()
+        )
+        and importlib.util.find_spec("pytest") is not None
+    ):
         commands["test"] = "python3 -m pytest"
         evidence.append("pytest markers and importable pytest")
     if (root / "Cargo.toml").is_file():
@@ -119,7 +131,9 @@ def verification_commands(root: Path) -> tuple[dict[str, str | None], list[str]]
         commands.setdefault("build", "go build ./...")
         commands.setdefault("lint", "go vet ./...")
         evidence.append("go.mod")
-    value = {name: commands.get(name) for name in ("test", "lint", "build", "typecheck")}
+    value = {
+        name: commands.get(name) for name in ("test", "lint", "build", "typecheck")
+    }
     value["package_manager"] = package_manager
     return value, evidence
 
@@ -154,17 +168,27 @@ def main() -> int:
         target = Path.cwd().resolve()
 
     inside_git = run("git", "rev-parse", "--is-inside-work-tree", cwd=target) == "true"
-    status = run("git", "status", "--porcelain=v1", cwd=target) if inside_git else ""
+    snapshot = repository_snapshot(target)
     verify_commands, detected_from = verification_commands(target)
     if not verify_commands["test"]:
-        notes.append("no test command detected; build a check seam or route to Reviewed")
+        notes.append(
+            "no test command detected; build a check seam or route to Reviewed"
+        )
     try:
         capability_manifest, capability_source = load_capabilities(args.capabilities)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
-        print(json.dumps({"schema": "workloop-probe/2", "error": f"invalid capabilities: {exc}"}))
+        print(
+            json.dumps(
+                {"schema": "workloop-probe/2", "error": f"invalid capabilities: {exc}"}
+            )
+        )
         return 2
 
-    missing = [field for field in CAPABILITY_FIELDS if capability_manifest is None or field not in capability_manifest]
+    missing = [
+        field
+        for field in CAPABILITY_FIELDS
+        if capability_manifest is None or field not in capability_manifest
+    ]
     ci_system: str | None = None
     if (target / ".github" / "workflows").is_dir():
         ci_system = "github-actions"
@@ -175,22 +199,36 @@ def main() -> int:
 
     markers = [
         name
-        for name in ("package.json", "Makefile", "pyproject.toml", "pytest.ini", "Cargo.toml", "go.mod")
+        for name in (
+            "package.json",
+            "Makefile",
+            "pyproject.toml",
+            "pytest.ini",
+            "Cargo.toml",
+            "go.mod",
+        )
         if (target / name).exists()
     ]
     output = {
         "schema": "workloop-probe/2",
         "probed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "target": str(target),
-        "os": {"name": platform.system() or "unknown", "arch": platform.machine() or "unknown"},
+        "os": {
+            "name": platform.system() or "unknown",
+            "arch": platform.machine() or "unknown",
+        },
         "host": host(),
         "git": {
             "available": shutil.which("git") is not None,
             "repo": inside_git,
-            "branch": run("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=target) if inside_git else None,
-            "head": run("git", "rev-parse", "HEAD", cwd=target) if inside_git else None,
-            "dirty_files": len(status.splitlines()) if status else 0,
-            "state_digest": "sha256:" + hashlib.sha256(status.encode()).hexdigest(),
+            "branch": run("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=target)
+            if inside_git
+            else None,
+            "head": snapshot["head"],
+            "dirty_files": snapshot["dirty_files"],
+            "file_count": snapshot["file_count"],
+            "snapshot_schema": snapshot["schema"],
+            "state_digest": snapshot["state_digest"],
             "version": runtime_version("git", "--version"),
         },
         "runtimes": {
