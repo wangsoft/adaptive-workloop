@@ -26,11 +26,15 @@
   "prompt": "Resume the workloop episode from yesterday",
   "setup": {},
   "artifact_root": "/runner-owned/output/cases/case-001/workspace",
-  "skill": {"name": "adaptive-workloop", "path": "/path/to/skill"}
+  "skill": {
+    "name": "adaptive-workloop",
+    "path": "/path/to/skill",
+    "digest": "sha256:..."
+  }
 }
 ```
 
-For `bare`, `skill` is `null`. For `previous`, the adapter resolves the pinned previous Skill revision outside the request. Keep repository fixture, runtime envelope, tool catalog, and sampling configuration equal across paired conditions.
+For `bare`, `skill` is `null`. For `previous`, `scripts/run-evals` requires `--previous-skill` and binds that exact checkout path and runtime-surface digest. Keep repository fixture, runtime envelope, tool catalog, sampling configuration, and independent grader equal across paired conditions.
 
 `host_profile` is optional for the general suites and mandatory for standalone conformance. Its digest binds the exact capability envelope to the run. `installed_skills` lists optional Skills available in addition to the candidate under test. During an adapter execution, the runner creates `artifact_root` inside that case's output directory. Dry-run requests omit it.
 
@@ -56,9 +60,11 @@ For `bare`, `skill` is `null`. For `previous`, the adapter resolves the pinned p
   },
   "runtime": {
     "host": "codex",
-    "model": "gpt-5.6-sol",
+    "configured_model": "gpt-5.6-sol",
+    "observed_model": "gpt-5.6-sol",
     "effort": "high",
-    "tool_manifest_digest": "sha256:..."
+    "provider_command_digest": "sha256:...",
+    "skill_installed": true
   },
   "trace": {
     "skill_calls": ["adaptive-workloop"]
@@ -71,6 +77,14 @@ Trigger cases are graded exactly by the runner. Behavior and regression outputs 
 Standalone cases are also code-graded. The adapter must derive `trace.skill_calls` from host instrumentation rather than model prose. Any Skill other than `adaptive-workloop` fails the Codex-standalone profile; required artifacts, terminal state, route, and explicit degradation mode must also match. Every returned artifact path must be relative to `artifact_root`, resolve inside it, name a regular file, and match the declared SHA-256. Strings, missing files, symlink escapes, duplicate paths, and digest mismatches fail grading.
 
 Exit status 0 means all code-graded cases passed. Status 1 means a failure or adapter error, 2 means invalid invocation or suite data, and 3 means all produced outputs are valid but at least one still requires independent review. Use `--allow-review-required` only for an explicit collection stage that handles that pending review downstream.
+
+## Run evidence and process boundary
+
+Every executed run writes `run-manifest.json` with schema `workloop-eval-run/2`. Its canonical digest binds the adapter runtime (including the built-in provider adapter's shared module), Skill runtime surfaces, full suite file, selected case IDs, condition, trial count, model/host profile, time and output limits, and environment-variable names explicitly passed to the adapter. It records names, never values. `summary.json` binds the manifest, and each case binds its request, response, and grading files.
+
+The runner passes only a small OS allowlist plus variables named with `--pass-env`. It caps combined stdout/stderr before decoding, applies one deadline while writing stdin and while the adapter executes, and kills the adapter process group on failure. An adapter must apply an equally explicit boundary before invoking a nested provider CLI; the bundled adapters do this.
+
+`model_profile` is the configured matrix label. Adapters must separately record the configured and provider-observed model IDs when instrumentation exposes them. Never silently replace an observed ID with the configured label.
 
 ## Matrix protocol
 

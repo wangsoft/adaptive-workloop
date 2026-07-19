@@ -6,7 +6,7 @@
 
 > Process is a cost. Spend it where failure is expensive and remove it where the bare model already succeeds.
 
-Status: **0.2.2 candidate**. Deterministic package, integrity, security, CI, and Codex-standalone regressions are implemented; a real-model bare/previous/candidate behavior matrix is still required before stable promotion.
+Status: **0.3.0 candidate**. Deterministic package, integrity, security, reproducible collection, independent grading, paired comparison, provider-adapter, CI, and Codex-standalone regressions are implemented. Real-model proposer-blind held-out evidence is still required before stable promotion.
 
 ## When it activates
 
@@ -95,6 +95,21 @@ scripts/run-evals --suite standalone \
   --host-profile codex-standalone \
   --adapter <provider-adapter> \
   --output evals/runs/codex-standalone
+
+# collect pending behavior output, review it independently, then compare conditions
+export WORKLOOP_ADAPTER_MODEL=gpt-5.6-sol
+scripts/run-evals --suite behavior --condition candidate \
+  --adapter evals/adapters/codex-cli \
+  --model-profile codex-gpt-5.6-sol-high \
+  --pass-env WORKLOOP_ADAPTER_MODEL --pass-env CODEX_HOME \
+  --allow-review-required --output evals/runs/candidate
+scripts/grade-evals --run evals/runs/candidate \
+  --grader <independent-grader-adapter> \
+  --grader-profile <different-model-host-effort>
+scripts/compare-evals --bare evals/runs/bare \
+  --previous evals/runs/previous \
+  --candidate evals/runs/candidate \
+  --output evals/runs/comparison.json
 ```
 
 ## Storage
@@ -118,6 +133,8 @@ adaptive-workloop/
 │   ├── episode-state
 │   ├── check-episode
 │   ├── run-evals
+│   ├── grade-evals
+│   ├── compare-evals
 │   └── check
 ├── references/
 ├── assets/
@@ -131,17 +148,24 @@ adaptive-workloop/
 │   ├── regression-cases.json
 │   ├── standalone-cases.json
 │   ├── profiles/codex-standalone.json
+│   ├── adapters/codex-cli
+│   ├── adapters/claude-code
+│   ├── grader-contract.md
 │   └── adapter-contract.md
 └── tests/
 ```
 
 ## Evaluation
 
-`scripts/run-evals` validates all public suites and can execute a provider-neutral adapter. Requests never include expected labels. Trigger routing and standalone conformance are graded exactly. Standalone artifacts must exist under the runner-owned `artifact_root` and match the adapter-declared SHA-256 digest; path claims alone fail. Behavior and regression outputs remain review-required until an independent grader evaluates output, state, artifacts, and trace, and therefore exit with status 3 unless collection explicitly uses `--allow-review-required`.
+`scripts/run-evals` validates all public suites and can execute a provider-neutral adapter. Every run writes a self-digested manifest binding the Skill checkout, adapter runtime, full dataset, selected cases, condition, model/host profile, trial count, limits, and explicitly passed environment names. Adapter subprocesses inherit a deny-by-default environment, bounded combined output, one timeout covering stdin and execution, and process-group cleanup. Requests never include expected labels.
+
+Trigger routing and standalone conformance are graded exactly. Standalone artifacts must exist under the runner-owned `artifact_root` and match SHA-256 values computed by the adapter from regular files; model-supplied hashes and path claims are not trusted. Behavior and regression outputs remain review-required and exit 3 unless an explicit collection stage uses `--allow-review-required`. `scripts/grade-evals` verifies every source digest, rejects a grader whose runtime digest matches the producer, and writes separate review artifacts without replacing original grading. `scripts/compare-evals` accepts only compatible, completed runs and reports pass rate, Wilson interval, pass@k, pass^k, usage, duration, and paired candidate deltas.
+
+`evals/adapters/codex-cli` and `evals/adapters/claude-code` materialize only the bound candidate/previous Skill into an isolated case workspace; `bare` receives none. They use each CLI's structured-output mode, derive artifact hashes locally, and derive Skill calls from provider event instrumentation rather than model prose. Credentials, fixture roots, and model configuration must be named explicitly with `--pass-env`; see `evals/provider-adapters.md`. CI exercises these adapters against fake CLIs only—no real model call or quality claim is made by the deterministic suite.
 
 The standalone suite fixes `installed_skills=[]`, `subagents=false`, and `browser=false`; it covers all four routes, rejects any trace that calls an unavailable Skill, and requires the high-risk no-verifier path to stop at `needs_human`. This proves fallback wiring, not real-model quality.
 
-Run the same fixtures separately for `bare`, `previous`, and `candidate`, with the same model, host, effort, tools, repository snapshot, and runtime envelope. Use repeated trials and compare verified success, pass^k, human intervention, latency, cost, rollback, and incidents.
+Run the same fixtures separately for `bare`, an exact `--previous-skill` checkout, and `candidate`, with the same model, host, effort, tools, repository snapshot, grader, and runtime envelope. Use repeated trials and compare verified success, pass^k, human intervention, latency, cost, rollback, and incidents.
 
 Repository cases are public regressions, not held-out proof. Stable promotion requires a private held-out suite unavailable to the proposer.
 

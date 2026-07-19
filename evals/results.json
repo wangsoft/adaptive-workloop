@@ -31,6 +31,22 @@
         "ruff": "0.15.12 passed"
       },
       "limits": "No real-model bare/previous/candidate behavior trials were run. Standalone conformance used a deterministic fixture adapter. The strict external Agent Skills validator passed v0.2.1; v0.2.2 uses the same validated frontmatter shape but still requires a fresh external-validator run before release publication."
+    },
+    {
+      "date": "2026-07-19",
+      "id": "deterministic-candidate-0.3.0",
+      "kind": "deterministic-eval-closure",
+      "results": {
+        "unit_tests": "43/43 passed",
+        "run_provenance": "self-digested manifest binds Skill, adapter runtime, dataset, cases, model/host profile, trials, limits, and explicit environment names",
+        "runtime_isolation": "deny-by-default adapter environment, bounded stdin/stdout/stderr, timeout, and process-group cleanup regressions passed",
+        "independent_review": "source digest verification, producer/grader digest separation, immutable source grading, and reviewed-case regressions passed",
+        "paired_comparison": "compatibility rejection, independent-review consumption, Wilson interval, pass@k, pass^k, and paired-delta regressions passed",
+        "provider_adapters": "Codex and Claude Code command isolation, project-local Skill materialization, instrumented Skill trace, and locally derived artifact hash regressions passed against fake CLIs",
+        "suite_validation": "18 trigger, 11 behavior, 10 public regression, and 4 standalone cases validated",
+        "ruff": "0.15.12 passed"
+      },
+      "limits": "No real Codex, GPT-5.6-sol, Claude Code, or Claude Fable 5 model call was run. Provider adapters were exercised only against deterministic fake CLIs. No proposer-blind held-out suite, authentication/network path, or real-model bare/previous/candidate quality result is claimed. A fresh external Agent Skills validator run is still required before release publication."
     }
   ],
   "real_model_matrix": {

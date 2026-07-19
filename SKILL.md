@@ -3,9 +3,9 @@ name: adaptive-workloop
 description: "Risk-based process router for a multi-step engineering task. Use when work needs execution routing across ambiguity, high-risk changes, weak verification, independent review, multiple sessions, or model/host capabilities; when resuming a .workloop episode; or when the user explicitly asks how much process, verification, or coordination a task needs. Not for one-step edits, ordinary isolated bug fixes, standalone reviews, pure Q&A, explanations, or prose-only writing."
 license: MIT
 metadata:
-  version: "0.2.2"
+  version: "0.3.0"
   compatibility: "Host-agnostic instructions; deterministic scripts require Python 3.10+ on macOS/Linux."
-  status: "candidate — deterministic integrity gates pass; real-model bare/previous/candidate behavior matrix is still required before stable promotion"
+  status: "candidate — reproducible eval collection, independent review, and paired comparison gates pass deterministically; real-model held-out evidence is still required before stable promotion"
 ---
 
 # Adaptive Workloop
@@ -152,6 +152,13 @@ Write observed routing or verification failures to `.workloop/proposals/<date>-<
 
 Keep rejected changes and negative runs as regression evidence.
 
+Eval evidence is immutable and role-separated. `scripts/run-evals` binds the exact
+Skill, adapter runtime, dataset, cases, host, model profile, and runtime envelope;
+the producing adapter cannot grade behavior or regression output. Use a different
+executable with `scripts/grade-evals`, then compare only compatible completed runs
+with `scripts/compare-evals`. A public regression matrix may justify iteration but
+cannot replace proposer-blind held-out evidence.
+
 ## File map
 
 | Need | Read or run |
@@ -162,4 +169,4 @@ Keep rejected changes and negative runs as regression evidence.
 | Measured model behavior | `references/model-deltas.md`, `references/model-deltas.json` |
 | Codex-only compatibility | `evals/profiles/codex-standalone.json`, `evals/standalone-cases.json` |
 | Episode lifecycle and tracked-state redaction | `scripts/create-episode`, `scripts/episode-state`, `scripts/check-episode` |
-| Validation and comparison runs | `scripts/check`, `scripts/run-evals` |
+| Collection, independent review, paired comparison | `scripts/run-evals`, `scripts/grade-evals`, `scripts/compare-evals`, `evals/adapter-contract.md`, `evals/grader-contract.md` |

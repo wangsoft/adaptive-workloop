@@ -6,7 +6,7 @@
 
 > 流程是成本：失败代价高时才投入；裸模型已经稳定完成的地方就删除流程。
 
-当前状态：**0.2.2 candidate**。确定性包校验、完整性、安全、CI 和 Codex standalone 回归已经实现；在晋升 stable 前，仍需完成真实模型的 bare / previous / candidate 行为矩阵。
+当前状态：**0.3.0 candidate**。确定性包校验、完整性、安全、可复现收集、独立评分、配对比较、Provider adapter、CI 和 Codex standalone 回归已经实现；晋升 stable 前仍需真实模型的 proposer-blind held-out 证据。
 
 ## 何时触发
 
@@ -94,6 +94,21 @@ scripts/run-evals --suite standalone \
   --host-profile codex-standalone \
   --adapter <provider-adapter> \
   --output evals/runs/codex-standalone
+
+# 收集待审行为输出、独立评分，再比较三个条件
+export WORKLOOP_ADAPTER_MODEL=gpt-5.6-sol
+scripts/run-evals --suite behavior --condition candidate \
+  --adapter evals/adapters/codex-cli \
+  --model-profile codex-gpt-5.6-sol-high \
+  --pass-env WORKLOOP_ADAPTER_MODEL --pass-env CODEX_HOME \
+  --allow-review-required --output evals/runs/candidate
+scripts/grade-evals --run evals/runs/candidate \
+  --grader <independent-grader-adapter> \
+  --grader-profile <different-model-host-effort>
+scripts/compare-evals --bare evals/runs/bare \
+  --previous evals/runs/previous \
+  --candidate evals/runs/candidate \
+  --output evals/runs/comparison.json
 ```
 
 ## 状态存储
@@ -117,6 +132,8 @@ adaptive-workloop/
 │   ├── episode-state
 │   ├── check-episode
 │   ├── run-evals
+│   ├── grade-evals
+│   ├── compare-evals
 │   └── check
 ├── references/
 ├── assets/
@@ -130,17 +147,24 @@ adaptive-workloop/
 │   ├── regression-cases.json
 │   ├── standalone-cases.json
 │   ├── profiles/codex-standalone.json
+│   ├── adapters/codex-cli
+│   ├── adapters/claude-code
+│   ├── grader-contract.md
 │   └── adapter-contract.md
 └── tests/
 ```
 
 ## 评测
 
-`scripts/run-evals` 校验全部公开套件，也能运行 provider-neutral adapter。发送给 adapter 的 request 不包含 expected label。Trigger 和 standalone conformance 由 runner 精确评分。Standalone 产物必须真实存在于 runner 所有的 `artifact_root` 内，并与 adapter 声明的 SHA-256 一致；仅返回路径声明会失败。Behavior 与 Regression 在独立 grader 检查输出、状态、产物和 trace 前保持 `review_required`，因此默认以状态码 3 退出；只有明确使用 `--allow-review-required` 收集待审结果时才返回成功。
+`scripts/run-evals` 校验全部公开套件，也能运行 provider-neutral adapter。每次运行都会写入自摘要 manifest，绑定 Skill checkout、adapter runtime、完整数据集、选中用例、条件、model/host profile、trial 数、资源限制及显式传入的环境变量名。Adapter 子进程采用 deny-by-default 环境、合并输出上限、覆盖 stdin 与执行阶段的统一 timeout，以及整个进程组清理。发送给 adapter 的 request 不包含 expected label。
+
+Trigger 和 standalone conformance 由 runner 精确评分。Standalone 产物必须真实存在于 runner 所有的 `artifact_root` 内，SHA-256 由 adapter 从普通文件重新计算，不信任模型提供的 hash 或路径声明。Behavior 与 Regression 保持 `review_required`，除非收集阶段明确使用 `--allow-review-required`。`scripts/grade-evals` 会重验全部源摘要、拒绝与 producer runtime 摘要相同的 grader，并把 review 写到独立目录而不覆盖原始 grading。`scripts/compare-evals` 只接受兼容且已完成的 run，输出通过率、Wilson 区间、pass@k、pass^k、usage、耗时及候选版本的配对增量。
+
+`evals/adapters/codex-cli` 与 `evals/adapters/claude-code` 只把已绑定的 candidate/previous Skill 放入隔离 case workspace；`bare` 不安装 Skill。两者使用 CLI structured output，本地派生 artifact hash，并从 provider event instrumentation 而非模型自述派生 Skill 调用。凭据、fixture root 与模型配置必须通过 `--pass-env` 点名；详见 `evals/provider-adapters.md`。CI 只用 fake CLI 验证 adapter，不会调用真实模型，也不构成模型质量结论。
 
 Standalone suite 固定 `installed_skills=[]`、`subagents=false`、`browser=false`，覆盖四条路线，拒绝 trace 中调用任何不可用 Skill，并要求缺少独立 verifier 的高风险任务停在 `needs_human`。它证明 fallback wiring，不代表真实模型质量。
 
-对同一 fixture 分别运行 `bare`、`previous`、`candidate`，固定模型、Host、effort、tools、repository snapshot 与 runtime envelope。进行重复 trial，比较 verified success、pass^k、人工介入、延迟、成本、回滚和事故，而不只比较路线文案。
+对同一 fixture 分别运行 `bare`、绑定精确 `--previous-skill` checkout 的 `previous`、`candidate`，固定模型、Host、effort、tools、repository snapshot、grader 与 runtime envelope。进行重复 trial，比较 verified success、pass^k、人工介入、延迟、成本、回滚和事故，而不只比较路线文案。
 
 仓库内用例属于公开回归，不是真正 held-out 证据。Stable 晋升需要 proposer 无法访问的私有 held-out suite。
 
