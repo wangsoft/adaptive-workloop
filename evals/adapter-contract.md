@@ -82,12 +82,14 @@ Exit status 0 means all code-graded cases passed. Status 1 means a failure or ad
 
 Every executed run writes `run-manifest.json` with schema `workloop-eval-run/2`. Its canonical digest binds the adapter runtime (including the built-in provider adapter's shared module), Skill runtime surfaces, full suite file, selected case IDs, condition, trial count, model/host profile, time and output limits, and environment-variable names explicitly passed to the adapter. It records names, never values. `summary.json` binds the manifest, and each case binds its request, response, and grading files.
 
+The dataset binding also records `evidence_class`, `origin`, and `held_out`. Built-in repository suites are always public. `--dataset <path>` requires an explicit `--evidence-class`; the external file must contain an identical `evidence_class` and a consistent boolean `held_out`. The runner rejects attempts to relabel public cases as held-out. Expected labels remain in the bound dataset for the independent grader but never enter producer requests.
+
 The runner passes only a small OS allowlist plus variables named with `--pass-env`. It caps combined stdout/stderr before decoding, applies one deadline while writing stdin and while the adapter executes, and kills the adapter process group on failure. An adapter must apply an equally explicit boundary before invoking a nested provider CLI; the bundled adapters do this.
 
 `model_profile` is the configured matrix label. Adapters must separately record the configured and provider-observed model IDs when instrumentation exposes them. Never silently replace an observed ID with the configured label.
 
 ## Matrix protocol
 
-Run the same case selection and trial count separately for `bare`, `previous`, and `candidate`, using distinct output directories. Use at least three trials for nondeterministic models. Compare verified success, pass^k, human intervention, latency distribution, cost per verified outcome, tool path, rollback, and incidents—not route prose alone.
+Prefer `scripts/run-matrix` to run the same case selection and trial count for `bare`, `previous`, and `candidate`. It uses distinct numbered attempts, independently grades review-required suites, and compares only compatible completed evidence. Use at least three trials for nondeterministic models. Compare verified success, pass^k, human intervention, latency distribution, cost per verified outcome, tool path, rollback, and incidents—not route prose alone.
 
 Repository-visible cases are public regressions. Keep release-decision held-out tasks outside the Skill repository and unavailable to the proposer.

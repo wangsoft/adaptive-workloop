@@ -6,7 +6,7 @@
 
 > 流程是成本：失败代价高时才投入；裸模型已经稳定完成的地方就删除流程。
 
-当前状态：**0.3.0 candidate**。确定性包校验、完整性、安全、可复现收集、独立评分、配对比较、Provider adapter、CI 和 Codex standalone 回归已经实现；晋升 stable 前仍需真实模型的 proposer-blind held-out 证据。
+当前状态：**0.4.0 candidate**。确定性包校验、完整性、安全、证据类别绑定、隔离独立评分、可恢复三条件矩阵、fail-closed 晋升决策、Provider adapter、CI 和 Codex standalone 回归已经实现；晋升 stable 前仍需真实模型的 proposer-blind held-out 证据。
 
 ## 何时触发
 
@@ -95,20 +95,33 @@ scripts/run-evals --suite standalone \
   --adapter <provider-adapter> \
   --output evals/runs/codex-standalone
 
-# 收集待审行为输出、独立评分，再比较三个条件
+# 收集、独立评分并比较 bare/previous/candidate 三个条件
 export WORKLOOP_ADAPTER_MODEL=gpt-5.6-sol
-scripts/run-evals --suite behavior --condition candidate \
+export WORKLOOP_GRADER_MODEL=claude-fable-5
+scripts/run-matrix --suite behavior --case bc-001 --trials 3 \
   --adapter evals/adapters/codex-cli \
+  --grader evals/adapters/claude-grader \
+  --grader-profile claude-code-fable-5-high \
+  --previous-skill /path/to/adaptive-workloop-v0.3.0 \
   --model-profile codex-gpt-5.6-sol-high \
   --pass-env WORKLOOP_ADAPTER_MODEL --pass-env CODEX_HOME \
-  --allow-review-required --output evals/runs/candidate
-scripts/grade-evals --run evals/runs/candidate \
-  --grader <independent-grader-adapter> \
-  --grader-profile <different-model-host-effort>
-scripts/compare-evals --bare evals/runs/bare \
-  --previous evals/runs/previous \
-  --candidate evals/runs/candidate \
-  --output evals/runs/comparison.json
+  --pass-env WORKLOOP_GRADER_MODEL --pass-env ANTHROPIC_API_KEY \
+  --output evals/matrices/public
+
+# 中断后以新 attempt 续跑，不覆盖已有证据
+scripts/run-matrix <相同参数> --resume
+
+# 私有数据集必须自洽标记，并保存在当前 checkout 之外
+scripts/run-matrix --suite behavior \
+  --dataset /private/evals/behavior-held-out.json \
+  --evidence-class held-out <相同 Provider 与矩阵参数> \
+  --output evals/matrices/held-out
+
+# 决策最多进入 eligible_for_human_approval，不会自动晋升
+scripts/decide-promotion --policy evals/promotion-policy.json \
+  --comparison evals/matrices/public/comparisons/attempt-001.json \
+  --comparison evals/matrices/held-out/comparisons/attempt-001.json \
+  --output evals/matrices/promotion-decision.json
 ```
 
 ## 状态存储
@@ -134,6 +147,8 @@ adaptive-workloop/
 │   ├── run-evals
 │   ├── grade-evals
 │   ├── compare-evals
+│   ├── run-matrix
+│   ├── decide-promotion
 │   └── check
 ├── references/
 ├── assets/
@@ -149,6 +164,10 @@ adaptive-workloop/
 │   ├── profiles/codex-standalone.json
 │   ├── adapters/codex-cli
 │   ├── adapters/claude-code
+│   ├── adapters/codex-grader
+│   ├── adapters/claude-grader
+│   ├── promotion-policy.json
+│   ├── matrix-protocol.md
 │   ├── grader-contract.md
 │   └── adapter-contract.md
 └── tests/
@@ -156,11 +175,15 @@ adaptive-workloop/
 
 ## 评测
 
-`scripts/run-evals` 校验全部公开套件，也能运行 provider-neutral adapter。每次运行都会写入自摘要 manifest，绑定 Skill checkout、adapter runtime、完整数据集、选中用例、条件、model/host profile、trial 数、资源限制及显式传入的环境变量名。Adapter 子进程采用 deny-by-default 环境、合并输出上限、覆盖 stdin 与执行阶段的统一 timeout，以及整个进程组清理。发送给 adapter 的 request 不包含 expected label。
+`scripts/run-evals` 校验全部公开套件，也能运行 provider-neutral adapter。每次运行都会写入自摘要 manifest，绑定 Skill checkout、adapter runtime、完整数据集、证据类别、选中用例、条件、model/host profile、trial 数、资源限制及显式传入的环境变量名。仓库内数据集固定为 `public`；外部数据集必须显式传入匹配的 `--evidence-class`，且文件内 `evidence_class` 与布尔 `held_out` 必须一致，否则 fail closed。Adapter 子进程采用 deny-by-default 环境、合并输出上限、覆盖 stdin 与执行阶段的统一 timeout，以及整个进程组清理。发送给 adapter 的 request 不包含 expected label。
 
 Trigger 和 standalone conformance 由 runner 精确评分。Standalone 产物必须真实存在于 runner 所有的 `artifact_root` 内，SHA-256 由 adapter 从普通文件重新计算，不信任模型提供的 hash 或路径声明。Behavior 与 Regression 保持 `review_required`，除非收集阶段明确使用 `--allow-review-required`。`scripts/grade-evals` 会重验全部源摘要、拒绝与 producer runtime 摘要相同的 grader，并把 review 写到独立目录而不覆盖原始 grading。`scripts/compare-evals` 只接受兼容且已完成的 run，输出通过率、Wilson 区间、pass@k、pass^k、usage、耗时及候选版本的配对增量。
 
-`evals/adapters/codex-cli` 与 `evals/adapters/claude-code` 只把已绑定的 candidate/previous Skill 放入隔离 case workspace；`bare` 不安装 Skill。两者使用 CLI structured output，本地派生 artifact hash，并从 provider event instrumentation 而非模型自述派生 Skill 调用。凭据、fixture root 与模型配置必须通过 `--pass-env` 点名；详见 `evals/provider-adapters.md`。CI 只用 fake CLI 验证 adapter，不会调用真实模型，也不构成模型质量结论。
+`evals/adapters/codex-cli` 与 `evals/adapters/claude-code` 只把已绑定的 candidate/previous Skill 放入隔离 case workspace；`bare` 不安装 Skill。两者使用 CLI structured output，本地派生 artifact hash，并从 provider event instrumentation 而非模型自述派生 Skill 调用。内置 Codex 与 Claude grader 均运行在全新临时 workspace；Codex 使用只读 sandbox 并忽略项目规则，Claude 禁用工具、slash command、持久会话及未显式配置的 MCP。配置模型身份与 Provider 实际观察身份分开记录。
+
+`scripts/run-matrix` 是标准三条件编排器：执行前绑定脚本、adapter、grader、数据集、candidate/previous Skill 摘要、profile、资源上限及环境变量名。自摘要 append-only event chain 与编号 attempt 使 `--resume` 能在中断后继续，且不覆盖部分证据。`scripts/decide-promotion` 读取自摘要 comparison 与严格 policy，校验必需的 public/held-out 类别、trial 数、通过率、配对退化及资源比率，只输出 `rejected`、`inconclusive` 或 `eligible_for_human_approval`，并始终记录 `promotion_authorized=false`。
+
+凭据、fixture root 与模型配置必须通过 `--pass-env` 点名；详见 `evals/provider-adapters.md` 与 `evals/matrix-protocol.md`。CI 只用 fake CLI 验证全部 adapter，不会调用真实模型，也不构成模型质量结论。
 
 Standalone suite 固定 `installed_skills=[]`、`subagents=false`、`browser=false`，覆盖四条路线，拒绝 trace 中调用任何不可用 Skill，并要求缺少独立 verifier 的高风险任务停在 `needs_human`。它证明 fallback wiring，不代表真实模型质量。
 

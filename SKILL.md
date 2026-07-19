@@ -3,9 +3,9 @@ name: adaptive-workloop
 description: "Risk-based process router for a multi-step engineering task. Use when work needs execution routing across ambiguity, high-risk changes, weak verification, independent review, multiple sessions, or model/host capabilities; when resuming a .workloop episode; or when the user explicitly asks how much process, verification, or coordination a task needs. Not for one-step edits, ordinary isolated bug fixes, standalone reviews, pure Q&A, explanations, or prose-only writing."
 license: MIT
 metadata:
-  version: "0.3.0"
+  version: "0.4.0"
   compatibility: "Host-agnostic instructions; deterministic scripts require Python 3.10+ on macOS/Linux."
-  status: "candidate — reproducible eval collection, independent review, and paired comparison gates pass deterministically; real-model held-out evidence is still required before stable promotion"
+  status: "candidate — evidence-class binding, isolated independent graders, resumable eval matrices, and fail-closed promotion gates pass deterministically; real-model held-out evidence is still required before stable promotion"
 ---
 
 # Adaptive Workloop
@@ -153,11 +153,17 @@ Write observed routing or verification failures to `.workloop/proposals/<date>-<
 Keep rejected changes and negative runs as regression evidence.
 
 Eval evidence is immutable and role-separated. `scripts/run-evals` binds the exact
-Skill, adapter runtime, dataset, cases, host, model profile, and runtime envelope;
-the producing adapter cannot grade behavior or regression output. Use a different
-executable with `scripts/grade-evals`, then compare only compatible completed runs
-with `scripts/compare-evals`. A public regression matrix may justify iteration but
-cannot replace proposer-blind held-out evidence.
+Skill, adapter runtime, dataset evidence class, cases, host, model profile, and
+runtime envelope; the producing adapter cannot grade behavior or regression
+output. Prefer `scripts/run-matrix` to collect, independently grade, and compare
+bare/previous/candidate through an append-only resumable stage log. External
+datasets must explicitly and consistently declare `public`, `held-in`, or
+`held-out`; expected labels never enter producer requests.
+
+Apply `scripts/decide-promotion` to public and proposer-blind held-out comparison
+artifacts. It fails closed on missing evidence, candidate drift, regression,
+insufficient trials, or resource-policy failure. An eligible result never
+authorizes promotion: human approval and the version bump remain separate gates.
 
 ## File map
 
@@ -169,4 +175,4 @@ cannot replace proposer-blind held-out evidence.
 | Measured model behavior | `references/model-deltas.md`, `references/model-deltas.json` |
 | Codex-only compatibility | `evals/profiles/codex-standalone.json`, `evals/standalone-cases.json` |
 | Episode lifecycle and tracked-state redaction | `scripts/create-episode`, `scripts/episode-state`, `scripts/check-episode` |
-| Collection, independent review, paired comparison | `scripts/run-evals`, `scripts/grade-evals`, `scripts/compare-evals`, `evals/adapter-contract.md`, `evals/grader-contract.md` |
+| Collection, independent review, paired comparison, promotion | `scripts/run-matrix`, `scripts/run-evals`, `scripts/grade-evals`, `scripts/compare-evals`, `scripts/decide-promotion`, `evals/matrix-protocol.md` |

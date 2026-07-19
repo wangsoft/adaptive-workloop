@@ -47,6 +47,21 @@
         "ruff": "0.15.12 passed"
       },
       "limits": "No real Codex, GPT-5.6-sol, Claude Code, or Claude Fable 5 model call was run. Provider adapters were exercised only against deterministic fake CLIs. No proposer-blind held-out suite, authentication/network path, or real-model bare/previous/candidate quality result is claimed. A fresh external Agent Skills validator run is still required before release publication."
+    },
+    {
+      "date": "2026-07-19",
+      "id": "deterministic-candidate-0.4.0",
+      "kind": "deterministic-promotion-governance",
+      "results": {
+        "unit_tests": "53 discovered; 52 passed and 1 intentional recursive-check guard skipped",
+        "dataset_governance": "external public/held-in/held-out classification, held_out consistency, exact digest rebinding, repository relabel rejection, and producer label non-disclosure regressions passed",
+        "independent_graders": "Codex read-only fresh-context and Claude tool-disabled fresh-context grader adapters passed against fake CLIs with configured/observed identity separation and exact criterion-coverage enforcement",
+        "matrix_recovery": "bound bare/previous/candidate orchestration, append-only event chain, numbered attempts, interrupted-collection recovery, independent grading, and paired comparison regressions passed",
+        "promotion_policy": "required public plus held-out evidence, candidate Skill identity, minimum trials/pass rate, paired loss, token ratio, missing-evidence inconclusive state, and human-only eligibility regressions passed",
+        "suite_validation": "18 trigger, 11 behavior, 10 public regression, and 4 standalone cases validated",
+        "ruff": "0.15.12 passed"
+      },
+      "limits": "No real Codex, GPT-5.6-sol, Claude Code, Claude Fable 5, private held-out corpus, authentication/network path, or paid provider call was run. Fake CLIs prove control flow and isolation only, not producer or grader quality. No stable promotion is claimed; a fresh external Agent Skills validator and real proposer-blind matrix remain required before release publication."
     }
   ],
   "real_model_matrix": {
