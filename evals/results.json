@@ -15,6 +15,22 @@
         "ruff": "passed"
       },
       "limits": "No real-model bare/previous/candidate behavior trials were run. Standalone conformance used a deterministic fixture adapter, so this is package and control evidence only."
+    },
+    {
+      "date": "2026-07-19",
+      "id": "deterministic-candidate-0.2.2",
+      "kind": "deterministic-integrity",
+      "results": {
+        "unit_tests": "27/27 passed",
+        "trigger_schema": "18 cases validated (9 positive, 9 negative)",
+        "behavior_schema": "11 cases validated; ungraded output exits 3 by default",
+        "public_regression_schema": "10 cases validated; ungraded output exits 3 by default",
+        "standalone_conformance": "4/4 fixture trials passed with filesystem and SHA-256 artifact verification",
+        "durability": "content-based repository snapshot and event-log recovery regressions passed",
+        "security": "tracked-episode redaction and completion-gate regressions passed",
+        "ruff": "0.15.12 passed"
+      },
+      "limits": "No real-model bare/previous/candidate behavior trials were run. Standalone conformance used a deterministic fixture adapter. The strict external Agent Skills validator passed v0.2.1; v0.2.2 uses the same validated frontmatter shape but still requires a fresh external-validator run before release publication."
     }
   ],
   "real_model_matrix": {

@@ -3,9 +3,9 @@ name: adaptive-workloop
 description: "Risk-based process router for a multi-step engineering task. Use when work needs execution routing across ambiguity, high-risk changes, weak verification, independent review, multiple sessions, or model/host capabilities; when resuming a .workloop episode; or when the user explicitly asks how much process, verification, or coordination a task needs. Not for one-step edits, ordinary isolated bug fixes, standalone reviews, pure Q&A, explanations, or prose-only writing."
 license: MIT
 metadata:
-  version: "0.2.1"
+  version: "0.2.2"
   compatibility: "Host-agnostic instructions; deterministic scripts require Python 3.10+ on macOS/Linux."
-  status: "candidate — deterministic checks pass; real-model bare/candidate behavior matrix is still required before stable promotion"
+  status: "candidate — deterministic integrity gates pass; real-model bare/previous/candidate behavior matrix is still required before stable promotion"
 ---
 
 # Adaptive Workloop
@@ -48,7 +48,7 @@ From the repository root, run:
 <skill-dir>/scripts/probe-capabilities . [--capabilities <host-manifest.json>]
 ```
 
-The script detects repository facts, verification commands, CI, runtimes, and host markers without scanning personal Skill directories. Supply host-only facts through a capability manifest:
+The script detects repository facts, verification commands, CI, runtimes, and host markers without scanning personal Skill directories. Its repository snapshot hashes tracked and untracked content while excluding `.git/` and `.workloop/`; a dirty-path label alone is not evidence of identical state. Supply host-only facts through a capability manifest:
 
 ```json
 {
@@ -130,6 +130,8 @@ After the contract is ready, start execution with `<skill-dir>/scripts/episode-s
 
 Close-out is strict: every automatic check passes, every manual criterion is attested, command output is visible, and `evidence/grading.json` exists. The verifier executes argv without a shell, constrains cwd to the repository, enforces timeouts, and refuses external-risk checks unless explicitly allowed. It is not a sandbox; host policy remains the enforcement boundary.
 
+Before a tracked Distributed episode can enter `complete`, `episode-state` enforces the redacted Git-visible surface with `scripts/check-episode`. It reports rule and location, never the matched value. `events.jsonl` is the durable write-ahead record; each state transition validates its sequence and status chain, then repairs a stale `state.json` cache before continuing.
+
 Any failure triggers a bounded fix and rerun. Two consecutive full-cycle failures, doubled scope, a newly discovered high-risk surface, user-contested quality, or a task crossing the session boundary reroutes upward and records an event.
 
 For high-risk work without an independent verifier, a labeled self-review may prepare a draft but cannot promote an irreversible action. Require a fresh session, human review, or another independent verifier before promotion.
@@ -159,5 +161,5 @@ Keep rejected changes and negative runs as regression evidence.
 | Resume, storage, handoff, recovery | `references/long-running.md` |
 | Measured model behavior | `references/model-deltas.md`, `references/model-deltas.json` |
 | Codex-only compatibility | `evals/profiles/codex-standalone.json`, `evals/standalone-cases.json` |
-| Episode lifecycle | `scripts/create-episode`, `scripts/episode-state` |
+| Episode lifecycle and tracked-state redaction | `scripts/create-episode`, `scripts/episode-state`, `scripts/check-episode` |
 | Validation and comparison runs | `scripts/check`, `scripts/run-evals` |

@@ -6,7 +6,7 @@
 
 > Process is a cost. Spend it where failure is expensive and remove it where the bare model already succeeds.
 
-Status: **0.2.1 candidate**. Deterministic package, security, and Codex-standalone regressions are implemented; a real-model bare/previous/candidate behavior matrix is still required before stable promotion.
+Status: **0.2.2 candidate**. Deterministic package, integrity, security, CI, and Codex-standalone regressions are implemented; a real-model bare/previous/candidate behavior matrix is still required before stable promotion.
 
 ## When it activates
 
@@ -48,7 +48,7 @@ Checks use argv arrays rather than shell strings:
 }
 ```
 
-The verifier executes without a shell, constrains cwd to the repository, enforces timeouts, prints successful output, and writes grading artifacts. Host sandbox, permissions, network policy, and user approval remain authoritative; verification is not a permission bypass.
+The verifier executes without a shell, constrains cwd to the repository, enforces timeouts, prints successful output, and writes grading artifacts. Repository snapshots hash file contents rather than only dirty path labels. Append-only events are the durable write-ahead record; a stale `state.json` cache is reconciled from the validated event chain before the next transition. Host sandbox, permissions, network policy, and user approval remain authoritative; verification is not a permission bypass.
 
 ## Install
 
@@ -83,6 +83,9 @@ scripts/verify-contract .workloop/local/<episode-id>
 scripts/episode-state .workloop/local/<episode-id> \
   --status verified --kind verification.passed --evidence evidence/grading.json
 
+# scan the Git-visible surface of a Distributed episode without printing secrets
+scripts/check-episode .workloop/tracked/<episode-id>
+
 # package and eval validation
 scripts/check
 scripts/run-evals --validate
@@ -113,6 +116,7 @@ adaptive-workloop/
 │   ├── create-episode
 │   ├── verify-contract
 │   ├── episode-state
+│   ├── check-episode
 │   ├── run-evals
 │   └── check
 ├── references/
@@ -133,13 +137,15 @@ adaptive-workloop/
 
 ## Evaluation
 
-`scripts/run-evals` validates all public suites and can execute a provider-neutral adapter. Requests never include expected labels. Trigger routing and standalone conformance are graded exactly; behavior and regression outputs remain review-required until an independent grader evaluates output, state, artifacts, and trace.
+`scripts/run-evals` validates all public suites and can execute a provider-neutral adapter. Requests never include expected labels. Trigger routing and standalone conformance are graded exactly. Standalone artifacts must exist under the runner-owned `artifact_root` and match the adapter-declared SHA-256 digest; path claims alone fail. Behavior and regression outputs remain review-required until an independent grader evaluates output, state, artifacts, and trace, and therefore exit with status 3 unless collection explicitly uses `--allow-review-required`.
 
 The standalone suite fixes `installed_skills=[]`, `subagents=false`, and `browser=false`; it covers all four routes, rejects any trace that calls an unavailable Skill, and requires the high-risk no-verifier path to stop at `needs_human`. This proves fallback wiring, not real-model quality.
 
 Run the same fixtures separately for `bare`, `previous`, and `candidate`, with the same model, host, effort, tools, repository snapshot, and runtime envelope. Use repeated trials and compare verified success, pass^k, human intervention, latency, cost, rollback, and incidents.
 
 Repository cases are public regressions, not held-out proof. Stable promotion requires a private held-out suite unavailable to the proposer.
+
+GitHub CI runs the deterministic gate and pinned Ruff checks on Python 3.10, 3.12, and 3.14 on Linux, plus Python 3.12 on macOS. The runtime package itself remains standard-library-only.
 
 ## Model policy
 

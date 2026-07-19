@@ -6,7 +6,7 @@
 
 > 流程是成本：失败代价高时才投入；裸模型已经稳定完成的地方就删除流程。
 
-当前状态：**0.2.1 candidate**。确定性包校验、安全回归和 Codex standalone 回归已经实现；在晋升 stable 前，仍需完成真实模型的 bare / previous / candidate 行为矩阵。
+当前状态：**0.2.2 candidate**。确定性包校验、完整性、安全、CI 和 Codex standalone 回归已经实现；在晋升 stable 前，仍需完成真实模型的 bare / previous / candidate 行为矩阵。
 
 ## 何时触发
 
@@ -48,7 +48,7 @@ Check 使用 argv 数组，不接受 Shell 字符串：
 }
 ```
 
-验证器不经过 Shell，限制 cwd 不得逃逸仓库，强制 timeout，输出成功命令的 stdout/stderr，并保存 grading artifact。Host 的 sandbox、权限、网络策略和用户批准始终权威；验证器不是权限绕过通道。
+验证器不经过 Shell，限制 cwd 不得逃逸仓库，强制 timeout，输出成功命令的 stdout/stderr，并保存 grading artifact。仓库快照摘要基于文件内容，而不只是 dirty path 标签。Append-only events 是持久 write-ahead record；下一次状态迁移前会先校验事件链，并从中修复陈旧的 `state.json` cache。Host 的 sandbox、权限、网络策略和用户批准始终权威；验证器不是权限绕过通道。
 
 ## 安装
 
@@ -82,6 +82,9 @@ scripts/verify-contract .workloop/local/<episode-id>
 scripts/episode-state .workloop/local/<episode-id> \
   --status verified --kind verification.passed --evidence evidence/grading.json
 
+# 扫描 Distributed episode 的 Git 可见面，不输出命中的敏感值
+scripts/check-episode .workloop/tracked/<episode-id>
+
 # 包与 Eval 校验
 scripts/check
 scripts/run-evals --validate
@@ -112,6 +115,7 @@ adaptive-workloop/
 │   ├── create-episode
 │   ├── verify-contract
 │   ├── episode-state
+│   ├── check-episode
 │   ├── run-evals
 │   └── check
 ├── references/
@@ -132,13 +136,15 @@ adaptive-workloop/
 
 ## 评测
 
-`scripts/run-evals` 校验全部公开套件，也能运行 provider-neutral adapter。发送给 adapter 的 request 不包含 expected label。Trigger 和 standalone conformance 由 runner 精确评分；Behavior 与 Regression 在独立 grader 检查输出、状态、产物和 trace 前保持 `review_required`。
+`scripts/run-evals` 校验全部公开套件，也能运行 provider-neutral adapter。发送给 adapter 的 request 不包含 expected label。Trigger 和 standalone conformance 由 runner 精确评分。Standalone 产物必须真实存在于 runner 所有的 `artifact_root` 内，并与 adapter 声明的 SHA-256 一致；仅返回路径声明会失败。Behavior 与 Regression 在独立 grader 检查输出、状态、产物和 trace 前保持 `review_required`，因此默认以状态码 3 退出；只有明确使用 `--allow-review-required` 收集待审结果时才返回成功。
 
 Standalone suite 固定 `installed_skills=[]`、`subagents=false`、`browser=false`，覆盖四条路线，拒绝 trace 中调用任何不可用 Skill，并要求缺少独立 verifier 的高风险任务停在 `needs_human`。它证明 fallback wiring，不代表真实模型质量。
 
 对同一 fixture 分别运行 `bare`、`previous`、`candidate`，固定模型、Host、effort、tools、repository snapshot 与 runtime envelope。进行重复 trial，比较 verified success、pass^k、人工介入、延迟、成本、回滚和事故，而不只比较路线文案。
 
 仓库内用例属于公开回归，不是真正 held-out 证据。Stable 晋升需要 proposer 无法访问的私有 held-out suite。
+
+GitHub CI 在 Linux 的 Python 3.10、3.12、3.14 和 macOS 的 Python 3.12 上执行确定性 gate 与固定版本 Ruff；运行时包本身仍然只依赖标准库。
 
 ## 模型策略
 
