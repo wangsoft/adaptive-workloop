@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Run one eval case through an isolated Codex CLI process."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+from provider_common import (
+    MODEL_RESULT_SCHEMA,
+    ProviderAdapterError,
+    adapter_response,
+    emit_or_fail,
+    model_configuration,
+    prepare_workspace,
+    provider_prompt,
+    read_request,
+    run_provider_jsonl,
+    validate_model_result,
+)
+
+
+def execute() -> tuple[dict[str, object], str]:
+    request = read_request()
+    context = prepare_workspace(
+        request, local_skill_path=Path(".agents/skills/adaptive-workloop")
+    )
+    model, effort = model_configuration(
+        {"low", "medium", "high", "xhigh", "max", "ultra"}
+    )
+    adapter_dir = context.workspace / ".workloop-adapter"
+    adapter_dir.mkdir()
+    schema_path = adapter_dir / "model-result.schema.json"
+    schema_path.write_text(
+        json.dumps(MODEL_RESULT_SCHEMA, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    result_path = adapter_dir / "model-result.json"
+    binary = os.environ.get("WORKLOOP_CODEX_BIN", "codex")
+    argv = [
+        binary,
+        "exec",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--sandbox",
+        "workspace-write",
+        "-C",
+        str(context.workspace),
+        "--skip-git-repo-check",
+        "--output-schema",
+        str(schema_path),
+        "--json",
+        "-o",
+        str(result_path),
+        "--model",
+        model,
+        "-c",
+        f'model_reasoning_effort="{effort}"',
+        "-",
+    ]
+    execution = run_provider_jsonl(
+        argv,
+        context,
+        provider_prompt(context),
+        environment_names={
+            "ALL_PROXY",
+            "CODEX_HOME",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENAI_ORG_ID",
+            "OPENAI_PROJECT_ID",
+            "REQUESTS_CA_BUNDLE",
+            "SSL_CERT_FILE",
+        },
+    )
+    if not result_path.is_file():
+        raise ProviderAdapterError("Codex did not write the structured result file")
+    try:
+        result = validate_model_result(
+            json.loads(result_path.read_text(encoding="utf-8"))
+        )
+    except json.JSONDecodeError as exc:
+        raise ProviderAdapterError(f"Codex result is invalid JSON: {exc}") from exc
+    response = adapter_response(
+        host="codex",
+        model=model,
+        effort=effort,
+        context=context,
+        execution=execution,
+        result=result,
+    )
+    return response, execution.stderr
+
+
+emit_or_fail(execute)

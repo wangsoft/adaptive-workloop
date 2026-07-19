@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
+import selectors
+import signal
 import stat
 import subprocess
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -51,6 +56,203 @@ SAFE_ASSIGNMENT_VALUES = {
     "null",
 }
 MAX_TRACKED_FILE_BYTES = 1024 * 1024
+SKILL_RUNTIME_SURFACES = ("SKILL.md", "agents", "scripts", "references", "assets")
+
+
+class BoundedCommandError(RuntimeError):
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+@dataclass(frozen=True)
+class BoundedCommandResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    duration_seconds: float
+
+
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    finally:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def run_bounded_command(
+    argv: list[str],
+    *,
+    input_bytes: bytes,
+    environment: dict[str, str],
+    timeout_seconds: float,
+    max_output_bytes: int,
+    cwd: Path | None = None,
+) -> BoundedCommandResult:
+    """Run one process group with bounded combined stdout/stderr."""
+
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            cwd=cwd,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise BoundedCommandError("start_error", str(exc)) from exc
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    selector = selectors.DefaultSelector()
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    input_view = memoryview(input_bytes)
+    input_offset = 0
+    os.set_blocking(process.stdin.fileno(), False)
+    if input_view:
+        selector.register(process.stdin, selectors.EVENT_WRITE)
+    else:
+        process.stdin.close()
+    for stream in streams:
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+    total = 0
+    deadline = started + timeout_seconds
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_process_group(process)
+                raise BoundedCommandError(
+                    "timeout", f"timed out after {timeout_seconds:g} seconds"
+                )
+            for key, _ in selector.select(min(remaining, 0.1)):
+                stream = key.fileobj
+                if stream is process.stdin:
+                    try:
+                        written = os.write(
+                            stream.fileno(),
+                            input_view[input_offset : input_offset + 65536],
+                        )
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        selector.unregister(stream)
+                        stream.close()
+                        continue
+                    input_offset += written
+                    if input_offset == len(input_view):
+                        selector.unregister(stream)
+                        stream.close()
+                    continue
+                try:
+                    chunk = os.read(stream.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                total += len(chunk)
+                if total > max_output_bytes:
+                    _kill_process_group(process)
+                    raise BoundedCommandError(
+                        "output_limit",
+                        f"output limit exceeded ({max_output_bytes} bytes)",
+                    )
+                streams[stream].extend(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_process_group(process)
+            raise BoundedCommandError(
+                "timeout", f"timed out after {timeout_seconds:g} seconds"
+            )
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            _kill_process_group(process)
+            raise BoundedCommandError(
+                "timeout", f"timed out after {timeout_seconds:g} seconds"
+            ) from exc
+    finally:
+        selector.close()
+        if not process.stdin.closed:
+            process.stdin.close()
+        for stream in (process.stdout, process.stderr):
+            if not stream.closed:
+                stream.close()
+    return BoundedCommandResult(
+        returncode=returncode,
+        stdout=bytes(streams[process.stdout]).decode("utf-8", errors="replace"),
+        stderr=bytes(streams[process.stderr]).decode("utf-8", errors="replace"),
+        duration_seconds=time.monotonic() - started,
+    )
+
+
+def sha256_bytes(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def adapter_runtime_digest(path: Path) -> str:
+    """Bind a single-file adapter and its conventional shared runtime module."""
+
+    path = path.resolve()
+    candidates = [path]
+    shared = path.parent / "provider_common.py"
+    if path.parent.name == "adapters" and shared.is_file() and shared != path:
+        candidates.append(shared)
+    digest = hashlib.sha256()
+    for candidate in candidates:
+        digest.update(candidate.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(candidate.read_bytes())
+        digest.update(b"\0")
+    return "sha256:" + digest.hexdigest()
+
+
+def canonical_json_digest(value: Any, *, omit: set[str] | None = None) -> str:
+    if omit and isinstance(value, dict):
+        value = {key: item for key, item in value.items() if key not in omit}
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return sha256_bytes(encoded)
+
+
+def skill_runtime_digest(root: Path) -> str:
+    root = root.resolve()
+    digest = hashlib.sha256()
+    for surface in SKILL_RUNTIME_SURFACES:
+        path = root / surface
+        candidates = [path] if path.is_file() else sorted(path.rglob("*"))
+        for candidate in candidates:
+            if not candidate.is_file() or any(
+                part in {"__pycache__", ".ruff_cache"} for part in candidate.parts
+            ):
+                continue
+            relative = candidate.relative_to(root).as_posix()
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(candidate.read_bytes())
+            digest.update(b"\0")
+    return "sha256:" + digest.hexdigest()
 
 
 def _git(

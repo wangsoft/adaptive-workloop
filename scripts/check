@@ -22,9 +22,13 @@ SCRIPT_NAMES = (
     "episode-state",
     "check-episode",
     "run-evals",
+    "grade-evals",
+    "compare-evals",
     "check",
 )
 PYTHON_MODULES = ("workloop_core.py",)
+ADAPTER_SCRIPTS = ("codex-cli", "claude-code")
+ADAPTER_MODULES = ("provider_common.py",)
 LEGACY_PATTERNS = {
     "legacy executable Markdown contract": re.compile(
         r"desc\s*::\s*(?:command|cmd)|- \[ \].*::"
@@ -153,6 +157,20 @@ def validate_scripts() -> None:
                 py_compile.compile(
                     str(path),
                     cfile=str(compile_dir / f"{name}.pyc"),
+                    doraise=True,
+                )
+            except py_compile.PyCompileError as exc:
+                fail(str(exc))
+        for name in (*ADAPTER_SCRIPTS, *ADAPTER_MODULES):
+            path = ROOT / "evals" / "adapters" / name
+            if not path.is_file():
+                fail(f"missing adapter file: evals/adapters/{name}")
+            if name in ADAPTER_SCRIPTS and not os.access(path, os.X_OK):
+                fail(f"adapter is not executable: evals/adapters/{name}")
+            try:
+                py_compile.compile(
+                    str(path),
+                    cfile=str(compile_dir / f"adapter-{name}.pyc"),
                     doraise=True,
                 )
             except py_compile.PyCompileError as exc:

@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+"""Compare compatible bare, previous, and candidate eval runs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+sys.dont_write_bytecode = True
+from workloop_core import canonical_json_digest, file_digest  # noqa: E402
+
+
+ARTIFACT_ID_RE = re.compile(r"^case-[0-9]{3,}$")
+
+
+class ComparisonError(ValueError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bare", required=True, type=Path)
+    parser.add_argument("--previous", type=Path)
+    parser.add_argument("--candidate", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
+    return parser.parse_args()
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ComparisonError(f"{path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ComparisonError(f"{path}: root must be an object")
+    return value
+
+
+def verify_digest(path: Path, expected: Any, label: str) -> None:
+    try:
+        actual = file_digest(path)
+    except OSError as exc:
+        raise ComparisonError(
+            f"{label} artifact is unavailable: {path}: {exc}"
+        ) from exc
+    if not isinstance(expected, str) or actual != expected:
+        raise ComparisonError(f"{label} digest mismatch: {path}")
+
+
+def effective_cases(
+    run_dir: Path, manifest: dict[str, Any], summary: dict[str, Any]
+) -> list[dict[str, Any]]:
+    source_cases = summary.get("cases")
+    if not isinstance(source_cases, list) or not source_cases:
+        raise ComparisonError(f"{run_dir}: summary cases must be non-empty")
+    source_by_artifact = {}
+    for item in source_cases:
+        if not isinstance(item, dict) or not isinstance(item.get("artifact_id"), str):
+            raise ComparisonError(f"{run_dir}: invalid source case")
+        source_by_artifact[item["artifact_id"]] = item
+
+    review_path = run_dir / "review-summary.json"
+    if review_path.exists():
+        review = load_json(review_path)
+        if review.get("schema") != "workloop-review-summary/1":
+            raise ComparisonError(f"{review_path}: unsupported schema")
+        if review.get("digest") != canonical_json_digest(review, omit={"digest"}):
+            raise ComparisonError(f"{review_path}: digest mismatch")
+        if review.get("source_run_manifest_digest") != manifest["digest"]:
+            raise ComparisonError(f"{review_path}: source manifest binding mismatch")
+        if review.get("grader", {}).get("digest") == manifest.get("adapter", {}).get(
+            "digest"
+        ):
+            raise ComparisonError(f"{review_path}: grader is not independent")
+        review_cases = review.get("cases")
+        if not isinstance(review_cases, list) or len(review_cases) != len(source_cases):
+            raise ComparisonError(f"{review_path}: review case count mismatch")
+        effective = []
+        seen = set()
+        for review_case in review_cases:
+            artifact_id = review_case.get("artifact_id")
+            if artifact_id not in source_by_artifact or artifact_id in seen:
+                raise ComparisonError(f"{review_path}: invalid artifact binding")
+            seen.add(artifact_id)
+            review_dir = run_dir / "reviews" / artifact_id
+            request_path = review_dir / "request.json"
+            verify_digest(
+                request_path,
+                review_case.get("request_digest"),
+                "review request",
+            )
+            review_request = load_json(request_path)
+            source_case = source_by_artifact[artifact_id]
+            source_binding = review_request.get("source")
+            if (
+                review_request.get("schema") != "workloop-grader-request/1"
+                or not isinstance(source_binding, dict)
+                or source_binding.get("run_manifest_digest") != manifest["digest"]
+                or source_binding.get("artifact_id") != artifact_id
+                or source_binding.get("case_id") != source_case.get("case_id")
+                or source_binding.get("trial") != source_case.get("trial")
+                or source_binding.get("request_digest")
+                != source_case.get("request_digest")
+                or source_binding.get("response_digest")
+                != source_case.get("response_digest")
+                or source_binding.get("grading_digest")
+                != source_case.get("grading_digest")
+            ):
+                raise ComparisonError(f"{review_path}: review request binding mismatch")
+            status = review_case.get("status")
+            if status not in {"passed", "failed"}:
+                raise ComparisonError(
+                    f"{review_path}: pending or errored review for {artifact_id}"
+                )
+            response_path = review_dir / "response.json"
+            verify_digest(
+                response_path,
+                review_case.get("response_digest"),
+                "review response",
+            )
+            review_response = load_json(response_path)
+            if (
+                review_response.get("schema") != "workloop-grader-response/1"
+                or review_response.get("status") != status
+                or review_case.get("usage") != review_response.get("usage", {})
+                or review_case.get("runtime") != review_response.get("runtime", {})
+            ):
+                raise ComparisonError(f"{review_path}: review response status mismatch")
+            merged = dict(source_by_artifact[artifact_id])
+            merged["status"] = status
+            merged["review_duration_seconds"] = review_case.get("duration_seconds", 0)
+            merged["review_usage"] = review_case.get("usage", {})
+            merged["review_runtime"] = review_case.get("runtime", {})
+            effective.append(merged)
+        return effective
+
+    pending = [
+        item["artifact_id"]
+        for item in source_cases
+        if item.get("status") == "review_required"
+    ]
+    invalid = [
+        item["artifact_id"]
+        for item in source_cases
+        if item.get("status") not in {"passed", "failed"}
+    ]
+    if pending or invalid:
+        raise ComparisonError(
+            f"{run_dir}: pending, errored, or unreviewed cases cannot be compared"
+        )
+    return source_cases
+
+
+def validate_source_summary(
+    run_dir: Path, manifest: dict[str, Any], summary: dict[str, Any]
+) -> None:
+    if summary.get("digest") != canonical_json_digest(summary, omit={"digest"}):
+        raise ComparisonError(f"{run_dir}: summary digest mismatch")
+    if (
+        summary.get("suite") != manifest.get("suite")
+        or summary.get("condition") != manifest.get("condition")
+        or summary.get("model_profile") != manifest.get("model_profile")
+        or summary.get("host_profile") != manifest.get("host_profile")
+        or summary.get("trials") != manifest.get("trials")
+    ):
+        raise ComparisonError(f"{run_dir}: summary does not match the run manifest")
+    selected_ids = manifest.get("dataset", {}).get("case_ids")
+    trials = manifest.get("trials")
+    if (
+        not isinstance(selected_ids, list)
+        or not all(isinstance(case_id, str) for case_id in selected_ids)
+        or len(selected_ids) != len(set(selected_ids))
+        or not isinstance(trials, int)
+        or isinstance(trials, bool)
+        or trials < 1
+    ):
+        raise ComparisonError(f"{run_dir}: invalid selected cases or trials")
+    expected_pairs = {
+        (case_id, trial) for case_id in selected_ids for trial in range(1, trials + 1)
+    }
+    cases = summary.get("cases")
+    if not isinstance(cases, list):
+        raise ComparisonError(f"{run_dir}: summary cases must be an array")
+    seen_artifacts: set[str] = set()
+    seen_pairs: set[tuple[str, int]] = set()
+    status_counts = {"passed": 0, "failed": 0, "review_required": 0, "error": 0}
+    for item in cases:
+        if not isinstance(item, dict):
+            raise ComparisonError(f"{run_dir}: invalid summary case")
+        artifact_id = item.get("artifact_id")
+        if (
+            not isinstance(artifact_id, str)
+            or not ARTIFACT_ID_RE.fullmatch(artifact_id)
+            or artifact_id in seen_artifacts
+        ):
+            raise ComparisonError(f"{run_dir}: invalid or duplicate artifact_id")
+        seen_artifacts.add(artifact_id)
+        pair = (item.get("case_id"), item.get("trial"))
+        if pair not in expected_pairs or pair in seen_pairs:
+            raise ComparisonError(f"{run_dir}: invalid or duplicate case trial")
+        seen_pairs.add(pair)
+        status = item.get("status")
+        if status not in status_counts:
+            raise ComparisonError(f"{run_dir}: invalid source status")
+        status_counts[status] += 1
+        if status == "error":
+            raise ComparisonError(f"{run_dir}: errored source case cannot be compared")
+        case_dir = run_dir / "cases" / artifact_id
+        loaded = {}
+        for name in ("request", "response", "grading"):
+            artifact_path = case_dir / f"{name}.json"
+            verify_digest(artifact_path, item.get(f"{name}_digest"), name)
+            loaded[name] = load_json(artifact_path)
+        request = loaded["request"]
+        response = loaded["response"]
+        grading = loaded["grading"]
+        if (
+            request.get("case_id") != pair[0]
+            or request.get("trial") != pair[1]
+            or request.get("suite") != manifest.get("suite")
+            or request.get("condition") != manifest.get("condition")
+        ):
+            raise ComparisonError(f"{run_dir}: request binding mismatch")
+        request_skill = request.get("skill")
+        manifest_skill_digest = manifest.get("skill", {}).get("digest")
+        if (manifest["condition"] == "bare" and request_skill is not None) or (
+            manifest["condition"] != "bare"
+            and (
+                not isinstance(request_skill, dict)
+                or request_skill.get("digest") != manifest_skill_digest
+            )
+        ):
+            raise ComparisonError(f"{run_dir}: request Skill binding mismatch")
+        if response.get("schema") != "workloop-adapter-response/1":
+            raise ComparisonError(f"{run_dir}: unsupported response schema")
+        if grading.get("status") != status:
+            raise ComparisonError(f"{run_dir}: grading status mismatch")
+        if item.get("usage") != response.get("usage", {}):
+            raise ComparisonError(f"{run_dir}: summary usage mismatch")
+        if item.get("runtime") != response.get("runtime", {}):
+            raise ComparisonError(f"{run_dir}: summary runtime mismatch")
+    if seen_pairs != expected_pairs:
+        raise ComparisonError(f"{run_dir}: incomplete paired case coverage")
+    if (
+        summary.get("total") != len(expected_pairs)
+        or summary.get("passed") != status_counts["passed"]
+        or summary.get("failed") != status_counts["failed"]
+        or summary.get("review_required") != status_counts["review_required"]
+        or summary.get("errors") != status_counts["error"]
+    ):
+        raise ComparisonError(f"{run_dir}: inconsistent summary aggregate counts")
+
+
+def load_run(label: str, run_dir: Path) -> dict[str, Any]:
+    run_dir = run_dir.resolve()
+    manifest = load_json(run_dir / "run-manifest.json")
+    summary = load_json(run_dir / "summary.json")
+    if manifest.get("schema") != "workloop-eval-run/2":
+        raise ComparisonError(f"{run_dir}: source run must use workloop-eval-run/2")
+    if manifest.get("digest") != canonical_json_digest(manifest, omit={"digest"}):
+        raise ComparisonError(f"{run_dir}: manifest digest mismatch")
+    if manifest.get("condition") != label or summary.get("condition") != label:
+        raise ComparisonError(f"{run_dir}: expected condition {label}")
+    if summary.get("run_manifest_digest") != manifest["digest"]:
+        raise ComparisonError(f"{run_dir}: summary manifest binding mismatch")
+    validate_source_summary(run_dir, manifest, summary)
+    cases = effective_cases(run_dir, manifest, summary)
+    review_path = run_dir / "review-summary.json"
+    review = load_json(review_path) if review_path.exists() else None
+    return {
+        "path": str(run_dir),
+        "manifest": manifest,
+        "summary": summary,
+        "review": review,
+        "cases": cases,
+    }
+
+
+def comparison_envelope(run: dict[str, Any]) -> dict[str, Any]:
+    manifest = run["manifest"]
+
+    def identity(runtime: Any) -> dict[str, Any]:
+        if not isinstance(runtime, dict):
+            return {}
+        fields = ("host", "configured_model", "observed_model", "effort")
+        return {field: runtime.get(field) for field in fields if field in runtime}
+
+    return {
+        "suite": manifest.get("suite"),
+        "model_profile": manifest.get("model_profile"),
+        "host_profile": manifest.get("host_profile"),
+        "adapter": manifest.get("adapter"),
+        "dataset": manifest.get("dataset"),
+        "trials": manifest.get("trials"),
+        "runtime": manifest.get("runtime"),
+        "producer_runtime_identities": [
+            {
+                "case_id": item["case_id"],
+                "trial": item["trial"],
+                "identity": identity(item.get("runtime")),
+            }
+            for item in sorted(
+                run["cases"], key=lambda item: (item["case_id"], item["trial"])
+            )
+        ],
+        "reviewer": (
+            {
+                "grader": run["review"].get("grader"),
+                "runtime": run["review"].get("runtime"),
+                "observed_identities": [
+                    {
+                        "case_id": item["case_id"],
+                        "trial": item["trial"],
+                        "identity": identity(item.get("runtime")),
+                    }
+                    for item in sorted(
+                        run["review"].get("cases", []),
+                        key=lambda item: (item["case_id"], item["trial"]),
+                    )
+                ],
+            }
+            if run["review"]
+            else None
+        ),
+    }
+
+
+def ensure_compatible(runs: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    reference_label = "bare"
+    reference = comparison_envelope(runs[reference_label])
+    for label, run in runs.items():
+        envelope = comparison_envelope(run)
+        for field, expected in reference.items():
+            if envelope[field] != expected:
+                raise ComparisonError(
+                    f"incompatible {field}: {label} does not match {reference_label}"
+                )
+        reference_keys = {
+            (item["case_id"], item["trial"]) for item in runs[reference_label]["cases"]
+        }
+        keys = {(item["case_id"], item["trial"]) for item in run["cases"]}
+        if keys != reference_keys:
+            raise ComparisonError(f"incompatible paired cases: {label}")
+    return reference
+
+
+def wilson_interval(passed: int, total: int) -> list[float]:
+    if total == 0:
+        return [0.0, 0.0]
+    z = 1.96
+    proportion = passed / total
+    denominator = 1 + z * z / total
+    center = (proportion + z * z / (2 * total)) / denominator
+    spread = (
+        z
+        * math.sqrt(proportion * (1 - proportion) / total + z * z / (4 * total * total))
+        / denominator
+    )
+    return [round(max(0.0, center - spread), 6), round(min(1.0, center + spread), 6)]
+
+
+def usage_metrics(cases: list[dict[str, Any]], field: str) -> dict[str, Any]:
+    active = field == "usage" or any(field in item for item in cases)
+    usages = [item.get(field, {}) for item in cases]
+
+    def tokens(key: str) -> int:
+        return sum(
+            value
+            for usage in usages
+            if isinstance(usage, dict) and isinstance((value := usage.get(key)), int)
+        )
+
+    costs = [usage.get("cost_usd") for usage in usages if isinstance(usage, dict)]
+    cost = (
+        round(sum(costs), 6)
+        if active and costs and all(isinstance(value, (int, float)) for value in costs)
+        else 0.0
+        if not active
+        else None
+    )
+    return {
+        "input_tokens": tokens("input_tokens"),
+        "cached_input_tokens": tokens("cached_input_tokens"),
+        "output_tokens": tokens("output_tokens"),
+        "cost_usd": cost,
+    }
+
+
+def condition_metrics(run: dict[str, Any]) -> dict[str, Any]:
+    cases = run["cases"]
+    passed = sum(item["status"] == "passed" for item in cases)
+    total = len(cases)
+    grouped: dict[str, list[bool]] = {}
+    for item in cases:
+        grouped.setdefault(item["case_id"], []).append(item["status"] == "passed")
+    producer_duration = sum(
+        float(item.get("duration_seconds", 0))
+        for item in cases
+        if isinstance(item.get("duration_seconds", 0), (int, float))
+    )
+    review_duration = sum(
+        float(item.get("review_duration_seconds", 0))
+        for item in cases
+        if isinstance(item.get("review_duration_seconds", 0), (int, float))
+    )
+    producer_usage = usage_metrics(cases, "usage")
+    review_usage = usage_metrics(cases, "review_usage")
+    combined_cost = (
+        round(producer_usage["cost_usd"] + review_usage["cost_usd"], 6)
+        if isinstance(producer_usage["cost_usd"], (int, float))
+        and isinstance(review_usage["cost_usd"], (int, float))
+        else None
+    )
+    return {
+        "run": run["path"],
+        "manifest_digest": run["manifest"]["digest"],
+        "total": total,
+        "passed": passed,
+        "failed": total - passed,
+        "pass_rate": round(passed / total, 6),
+        "wilson_95": wilson_interval(passed, total),
+        "duration_seconds": {
+            "producer": round(producer_duration, 3),
+            "reviewer": round(review_duration, 3),
+            "combined": round(producer_duration + review_duration, 3),
+        },
+        "usage": {
+            "producer": producer_usage,
+            "reviewer": review_usage,
+            "combined": {
+                "input_tokens": producer_usage["input_tokens"]
+                + review_usage["input_tokens"],
+                "cached_input_tokens": producer_usage["cached_input_tokens"]
+                + review_usage["cached_input_tokens"],
+                "output_tokens": producer_usage["output_tokens"]
+                + review_usage["output_tokens"],
+                "cost_usd": combined_cost,
+            },
+        },
+        "per_case": {
+            case_id: {
+                "trials": len(outcomes),
+                "passed": sum(outcomes),
+                "pass_at_k": 1.0 if any(outcomes) else 0.0,
+                "pass_pow_k": 1.0 if all(outcomes) else 0.0,
+            }
+            for case_id, outcomes in sorted(grouped.items())
+        },
+    }
+
+
+def paired_delta(
+    candidate: dict[str, Any], baseline: dict[str, Any], metrics: dict[str, Any]
+) -> dict[str, Any]:
+    candidate_outcomes = {
+        (item["case_id"], item["trial"]): item["status"] == "passed"
+        for item in candidate["cases"]
+    }
+    baseline_outcomes = {
+        (item["case_id"], item["trial"]): item["status"] == "passed"
+        for item in baseline["cases"]
+    }
+    wins = losses = ties = 0
+    for key, candidate_passed in candidate_outcomes.items():
+        baseline_passed = baseline_outcomes[key]
+        if candidate_passed and not baseline_passed:
+            wins += 1
+        elif baseline_passed and not candidate_passed:
+            losses += 1
+        else:
+            ties += 1
+    candidate_metrics = metrics["candidate"]
+    baseline_label = baseline["manifest"]["condition"]
+    baseline_metrics = metrics[baseline_label]
+    return {
+        "pass_rate": round(
+            candidate_metrics["pass_rate"] - baseline_metrics["pass_rate"], 6
+        ),
+        "paired_trials": {
+            "candidate_wins": wins,
+            "candidate_losses": losses,
+            "ties": ties,
+        },
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    paths = {"bare": args.bare, "candidate": args.candidate}
+    if args.previous is not None:
+        paths["previous"] = args.previous
+    try:
+        runs = {label: load_run(label, path) for label, path in paths.items()}
+        envelope = ensure_compatible(runs)
+        metrics = {label: condition_metrics(run) for label, run in runs.items()}
+        deltas = {
+            "candidate_vs_bare": paired_delta(runs["candidate"], runs["bare"], metrics)
+        }
+        if "previous" in runs:
+            deltas["candidate_vs_previous"] = paired_delta(
+                runs["candidate"], runs["previous"], metrics
+            )
+    except ComparisonError as exc:
+        print(f"compare-evals: {exc}", file=sys.stderr)
+        return 2
+
+    report = {
+        "schema": "workloop-eval-comparison/1",
+        "compatible_envelope": envelope,
+        "conditions": metrics,
+        "deltas": deltas,
+    }
+    report["digest"] = canonical_json_digest(report)
+    rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        args.output.write_text(rendered, encoding="utf-8")
+        print(f"compare-evals: {args.output}")
+    else:
+        print(rendered, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

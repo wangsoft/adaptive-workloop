@@ -1,4 +1,5 @@
-PY_SCRIPTS := scripts/check scripts/check-episode scripts/create-episode scripts/episode-state scripts/probe-capabilities scripts/run-evals scripts/verify-contract scripts/workloop_core.py
+PY_SCRIPTS := scripts/check scripts/check-episode scripts/compare-evals scripts/create-episode scripts/episode-state scripts/grade-evals scripts/probe-capabilities scripts/run-evals scripts/verify-contract scripts/workloop_core.py
+PY_ADAPTERS := evals/adapters/claude-code evals/adapters/codex-cli evals/adapters/provider_common.py
 
 .PHONY: check test lint eval-validate
 
@@ -9,8 +10,8 @@ test:
 	python3 -m unittest discover -s tests -v
 
 lint:
-	ruff check $(PY_SCRIPTS) tests
-	ruff format --check $(PY_SCRIPTS) tests
+	ruff check $(PY_SCRIPTS) $(PY_ADAPTERS) tests
+	ruff format --check $(PY_SCRIPTS) $(PY_ADAPTERS) tests
 
 eval-validate:
 	./scripts/run-evals --validate

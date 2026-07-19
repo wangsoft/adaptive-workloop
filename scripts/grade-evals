@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""Independently review pending behavior and regression eval artifacts."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+sys.dont_write_bytecode = True
+from workloop_core import (  # noqa: E402
+    BoundedCommandError,
+    adapter_runtime_digest,
+    canonical_json_digest,
+    file_digest,
+    run_bounded_command,
+)
+
+
+SAFE_ENV = ("LANG", "LC_ALL", "LC_CTYPE", "PATH", "TEMP", "TMP", "TMPDIR")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ARTIFACT_ID_RE = re.compile(r"^case-[0-9]{3,}$")
+REVIEW_STATUSES = {"passed", "failed", "needs_human"}
+
+
+class GraderError(ValueError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run", required=True, type=Path)
+    parser.add_argument("--grader", required=True, type=Path)
+    parser.add_argument(
+        "--grader-profile",
+        default="unspecified",
+        help="configured grader model/host/effort profile recorded in review evidence",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        help="exact suite JSON bound by the source run (defaults to repository suite)",
+    )
+    parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument("--max-output-bytes", type=int, default=1024 * 1024)
+    parser.add_argument("--pass-env", action="append", default=[], metavar="NAME")
+    return parser.parse_args()
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GraderError(f"{path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise GraderError(f"{path}: root must be an object")
+    return value
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def selected_environment(requested: list[str]) -> tuple[dict[str, str], list[str]]:
+    invalid = [name for name in requested if not ENV_NAME_RE.fullmatch(name)]
+    if invalid:
+        raise GraderError(f"invalid --pass-env names: {sorted(set(invalid))}")
+    missing = [name for name in requested if name not in os.environ]
+    if missing:
+        raise GraderError(f"--pass-env names are not set: {sorted(set(missing))}")
+    environment = {name: os.environ[name] for name in SAFE_ENV if name in os.environ}
+    passed_names = sorted(set(requested))
+    for name in passed_names:
+        environment[name] = os.environ[name]
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment, passed_names
+
+
+def verify_digest(path: Path, expected: Any, label: str) -> None:
+    try:
+        actual = file_digest(path)
+    except OSError as exc:
+        raise GraderError(f"{label} artifact is unavailable: {path}: {exc}") from exc
+    if not isinstance(expected, str) or actual != expected:
+        raise GraderError(f"{label} digest mismatch: {path}")
+
+
+def validate_source(
+    root: Path, run_dir: Path, dataset_arg: Path | None
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+    manifest = load_json(run_dir / "run-manifest.json")
+    summary = load_json(run_dir / "summary.json")
+    if manifest.get("schema") != "workloop-eval-run/2":
+        raise GraderError("source run must use schema workloop-eval-run/2")
+    expected_manifest_digest = canonical_json_digest(manifest, omit={"digest"})
+    if manifest.get("digest") != expected_manifest_digest:
+        raise GraderError("source run manifest digest mismatch")
+    if summary.get("run_manifest_digest") != manifest["digest"]:
+        raise GraderError("source summary does not bind the run manifest")
+    if summary.get("digest") != canonical_json_digest(summary, omit={"digest"}):
+        raise GraderError("source summary digest mismatch")
+    if summary.get("suite") != manifest.get("suite"):
+        raise GraderError("source summary suite does not match the run manifest")
+    if summary.get("condition") != manifest.get("condition") or summary.get(
+        "model_profile"
+    ) != manifest.get("model_profile"):
+        raise GraderError("source summary condition/model does not match the manifest")
+    if summary.get("host_profile") != manifest.get("host_profile"):
+        raise GraderError("source summary host profile does not match the manifest")
+    if manifest.get("suite") not in {"behavior", "regression"}:
+        raise GraderError("only behavior and regression runs use independent grading")
+    if manifest.get("dataset", {}).get("suite") != manifest["suite"] or not isinstance(
+        manifest.get("adapter", {}).get("digest"), str
+    ):
+        raise GraderError("source manifest has an invalid dataset or adapter binding")
+
+    dataset = dataset_arg or root / "evals" / f"{manifest['suite']}-cases.json"
+    if not dataset.is_file():
+        raise GraderError(f"dataset not found: {dataset}")
+    verify_digest(dataset, manifest.get("dataset", {}).get("digest"), "dataset")
+    dataset_value = load_json(dataset)
+    cases = dataset_value.get("cases")
+    if not isinstance(cases, list):
+        raise GraderError("dataset cases must be an array")
+    by_id = {
+        case["id"]: case
+        for case in cases
+        if isinstance(case, dict) and isinstance(case.get("id"), str)
+    }
+    selected_ids = manifest.get("dataset", {}).get("case_ids")
+    if (
+        not isinstance(selected_ids, list)
+        or any(
+            not isinstance(case_id, str) or case_id not in by_id
+            for case_id in selected_ids
+        )
+        or len(selected_ids) != len(set(selected_ids))
+    ):
+        raise GraderError("source run references cases absent from the bound dataset")
+    if any(
+        not isinstance(by_id[case_id].get("expected"), dict) for case_id in selected_ids
+    ):
+        raise GraderError(
+            "bound dataset cases need expected objects for independent grading"
+        )
+
+    summary_cases = summary.get("cases")
+    if not isinstance(summary_cases, list) or not summary_cases:
+        raise GraderError("source summary cases must be a non-empty array")
+    trials = manifest.get("trials")
+    if not isinstance(trials, int) or isinstance(trials, bool) or trials < 1:
+        raise GraderError("source manifest trials must be a positive integer")
+    expected_pairs = {
+        (case_id, trial) for case_id in selected_ids for trial in range(1, trials + 1)
+    }
+    seen_artifacts: set[str] = set()
+    seen_pairs: set[tuple[str, int]] = set()
+    for item in summary_cases:
+        if not isinstance(item, dict) or item.get("status") != "review_required":
+            raise GraderError(
+                "grade-evals only accepts runs whose cases require review"
+            )
+        artifact_id = item.get("artifact_id")
+        if (
+            not isinstance(artifact_id, str)
+            or not ARTIFACT_ID_RE.fullmatch(artifact_id)
+            or artifact_id in seen_artifacts
+        ):
+            raise GraderError("source summary has an invalid or duplicate artifact_id")
+        seen_artifacts.add(artifact_id)
+        pair = (item.get("case_id"), item.get("trial"))
+        if pair not in expected_pairs or pair in seen_pairs:
+            raise GraderError("source summary has an invalid or duplicate case trial")
+        seen_pairs.add(pair)
+        case_dir = run_dir / "cases" / artifact_id
+        loaded = {}
+        for name in ("request", "response", "grading"):
+            artifact_path = case_dir / f"{name}.json"
+            verify_digest(artifact_path, item.get(f"{name}_digest"), name)
+            loaded[name] = load_json(artifact_path)
+        request = loaded["request"]
+        response = loaded["response"]
+        grading = loaded["grading"]
+        if (
+            request.get("case_id") != pair[0]
+            or request.get("trial") != pair[1]
+            or request.get("suite") != manifest["suite"]
+            or request.get("condition") != manifest["condition"]
+        ):
+            raise GraderError("source request does not match its summary/manifest")
+        request_skill = request.get("skill")
+        manifest_skill_digest = manifest.get("skill", {}).get("digest")
+        if (manifest["condition"] == "bare" and request_skill is not None) or (
+            manifest["condition"] != "bare"
+            and (
+                not isinstance(request_skill, dict)
+                or request_skill.get("digest") != manifest_skill_digest
+            )
+        ):
+            raise GraderError(
+                "source request Skill binding does not match the manifest"
+            )
+        if response.get("schema") != "workloop-adapter-response/1":
+            raise GraderError("source response has an unsupported schema")
+        if grading.get("status") != "review_required":
+            raise GraderError("source grading status does not match its summary")
+        if item.get("usage") != response.get("usage", {}):
+            raise GraderError("source summary usage does not match its response")
+        if item.get("runtime") != response.get("runtime", {}):
+            raise GraderError("source summary runtime does not match its response")
+    if seen_pairs != expected_pairs:
+        raise GraderError("source summary does not cover every selected case trial")
+    expected_total = len(expected_pairs)
+    if (
+        summary.get("total") != expected_total
+        or summary.get("passed") != 0
+        or summary.get("failed") != 0
+        or summary.get("review_required") != expected_total
+        or summary.get("errors") != 0
+    ):
+        raise GraderError("source summary aggregate counts are inconsistent")
+    return manifest, summary, by_id
+
+
+def run_grader(
+    grader: Path,
+    request: dict[str, Any],
+    *,
+    environment: dict[str, str],
+    timeout: float,
+    max_output_bytes: int,
+) -> tuple[dict[str, Any], str, float]:
+    try:
+        result = run_bounded_command(
+            [str(grader)],
+            input_bytes=json.dumps(request).encode("utf-8"),
+            environment=environment,
+            timeout_seconds=timeout,
+            max_output_bytes=max_output_bytes,
+        )
+    except BoundedCommandError as exc:
+        raise GraderError(f"grader {exc.kind}: {exc}") from exc
+    if result.returncode != 0:
+        raise GraderError(f"grader exited {result.returncode}: {result.stderr.strip()}")
+    try:
+        response = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise GraderError(f"grader returned invalid JSON: {exc}") from exc
+    if (
+        not isinstance(response, dict)
+        or response.get("schema") != "workloop-grader-response/1"
+        or response.get("status") not in REVIEW_STATUSES
+        or not isinstance(response.get("rationale"), str)
+        or not isinstance(response.get("criteria"), list)
+    ):
+        raise GraderError(
+            "grader response must use workloop-grader-response/1 with status, rationale, and criteria"
+        )
+    return response, result.stderr, result.duration_seconds
+
+
+def main() -> int:
+    args = parse_args()
+    root = Path(__file__).resolve().parent.parent
+    run_dir = args.run.resolve()
+    try:
+        if args.timeout <= 0:
+            raise GraderError("--timeout must be positive")
+        if args.max_output_bytes < 1024:
+            raise GraderError("--max-output-bytes must be at least 1024")
+        if not args.grader.is_file() or not os.access(args.grader, os.X_OK):
+            raise GraderError(f"grader is not an executable file: {args.grader}")
+        if (run_dir / "review-summary.json").exists() or (run_dir / "reviews").exists():
+            raise GraderError("source run already contains review outputs")
+        manifest, summary, cases_by_id = validate_source(root, run_dir, args.dataset)
+        grader_digest = adapter_runtime_digest(args.grader)
+        if grader_digest == manifest.get("adapter", {}).get("digest"):
+            raise GraderError(
+                "grader must be independent from the producing adapter (digest matches)"
+            )
+        environment, passed_names = selected_environment(args.pass_env)
+    except GraderError as exc:
+        print(f"grade-evals: {exc}", file=sys.stderr)
+        return 2
+
+    review_cases: list[dict[str, Any]] = []
+    counts = {"passed": 0, "failed": 0, "needs_human": 0, "errors": 0}
+    reviews_dir = run_dir / "reviews"
+    reviews_dir.mkdir()
+    for source_case in summary["cases"]:
+        artifact_id = source_case["artifact_id"]
+        case_dir = run_dir / "cases" / artifact_id
+        review_dir = reviews_dir / artifact_id
+        review_dir.mkdir()
+        producer_request = load_json(case_dir / "request.json")
+        producer_response = load_json(case_dir / "response.json")
+        producer_grading = load_json(case_dir / "grading.json")
+        review_request = {
+            "schema": "workloop-grader-request/1",
+            "source": {
+                "run_manifest_digest": manifest["digest"],
+                "suite": manifest["suite"],
+                "condition": manifest["condition"],
+                "model_profile": manifest["model_profile"],
+                "artifact_id": artifact_id,
+                "case_id": source_case["case_id"],
+                "trial": source_case["trial"],
+                "request_digest": source_case["request_digest"],
+                "response_digest": source_case["response_digest"],
+                "grading_digest": source_case["grading_digest"],
+            },
+            "expected": cases_by_id[source_case["case_id"]]["expected"],
+            "producer_request": producer_request,
+            "producer_response": producer_response,
+            "producer_grading": producer_grading,
+        }
+        request_path = review_dir / "request.json"
+        write_json(request_path, review_request)
+        review_record: dict[str, Any] = {
+            "artifact_id": artifact_id,
+            "case_id": source_case["case_id"],
+            "trial": source_case["trial"],
+            "request_digest": file_digest(request_path),
+        }
+        try:
+            response, stderr, duration = run_grader(
+                args.grader,
+                review_request,
+                environment=environment,
+                timeout=args.timeout,
+                max_output_bytes=args.max_output_bytes,
+            )
+            response_path = review_dir / "response.json"
+            write_json(response_path, response)
+            (review_dir / "grader.stderr.txt").write_text(stderr, encoding="utf-8")
+            status = response["status"]
+            counts[status] += 1
+            review_record.update(
+                {
+                    "status": status,
+                    "duration_seconds": round(duration, 3),
+                    "usage": response.get("usage", {}),
+                    "runtime": response.get("runtime", {}),
+                    "response_digest": file_digest(response_path),
+                }
+            )
+        except GraderError as exc:
+            counts["errors"] += 1
+            (review_dir / "error.txt").write_text(str(exc) + "\n", encoding="utf-8")
+            review_record["status"] = "error"
+        review_cases.append(review_record)
+
+    review_summary = {
+        "schema": "workloop-review-summary/1",
+        "source_run_manifest_digest": manifest["digest"],
+        "grader": {
+            "name": args.grader.name,
+            "digest": grader_digest,
+            "profile": args.grader_profile,
+        },
+        "runtime": {
+            "timeout_seconds": args.timeout,
+            "max_output_bytes": args.max_output_bytes,
+            "environment_policy": "deny-by-default",
+            "passed_environment_names": passed_names,
+            "process_group_cleanup": True,
+        },
+        "total": len(review_cases),
+        **counts,
+        "cases": review_cases,
+    }
+    review_summary["digest"] = canonical_json_digest(review_summary)
+    write_json(run_dir / "review-summary.json", review_summary)
+    print(f"grade-evals: {run_dir / 'review-summary.json'}")
+    print(
+        "summary: "
+        f"{counts['passed']} passed, {counts['failed']} failed, "
+        f"{counts['needs_human']} need human review, {counts['errors']} errors"
+    )
+    if counts["failed"] or counts["errors"]:
+        return 1
+    if counts["needs_human"]:
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

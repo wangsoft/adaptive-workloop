@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Run one eval case through an isolated Claude Code CLI process."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+from provider_common import (
+    MODEL_RESULT_SCHEMA,
+    ProviderAdapterError,
+    adapter_response,
+    emit_or_fail,
+    model_configuration,
+    prepare_workspace,
+    provider_prompt,
+    read_request,
+    run_provider_jsonl,
+    validate_model_result,
+)
+
+
+def execute() -> tuple[dict[str, object], str]:
+    request = read_request()
+    context = prepare_workspace(
+        request, local_skill_path=Path(".claude/skills/adaptive-workloop")
+    )
+    model, effort = model_configuration({"low", "medium", "high", "xhigh", "max"})
+    binary = os.environ.get("WORKLOOP_CLAUDE_BIN", "claude")
+    argv = [
+        binary,
+        "-p",
+        "--bare",
+        "--output-format",
+        "stream-json",
+        "--json-schema",
+        json.dumps(MODEL_RESULT_SCHEMA, sort_keys=True, separators=(",", ":")),
+        "--model",
+        model,
+        "--effort",
+        effort,
+        "--no-session-persistence",
+        "--strict-mcp-config",
+        "--mcp-config",
+        "{}",
+        "--permission-mode",
+        "auto",
+        "--tools",
+        "default",
+        "--verbose",
+    ]
+    budget = os.environ.get("WORKLOOP_MAX_BUDGET_USD")
+    if budget:
+        argv.extend(["--max-budget-usd", budget])
+    execution = run_provider_jsonl(
+        argv,
+        context,
+        provider_prompt(context),
+        environment_names={
+            "ALL_PROXY",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_VERTEX_PROJECT_ID",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_DEFAULT_REGION",
+            "AWS_PROFILE",
+            "AWS_REGION",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLOUD_ML_REGION",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "REQUESTS_CA_BUNDLE",
+            "SSL_CERT_FILE",
+        },
+    )
+    result = None
+    for event in reversed(execution.events):
+        structured = event.get("structured_output")
+        if isinstance(structured, dict):
+            result = validate_model_result(structured)
+            break
+    if result is None:
+        raise ProviderAdapterError("Claude Code returned no structured_output event")
+    response = adapter_response(
+        host="claude-code",
+        model=model,
+        effort=effort,
+        context=context,
+        execution=execution,
+        result=result,
+    )
+    return response, execution.stderr
+
+
+emit_or_fail(execute)
