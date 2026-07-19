@@ -59,7 +59,11 @@ def parse_args() -> argparse.Namespace:
         choices=("network", "external-side-effect"),
         help="explicitly allow a non-local check risk class",
     )
-    parser.add_argument("--dry-run", action="store_true", help="validate and print checks without executing")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and print checks without executing",
+    )
     return parser.parse_args()
 
 
@@ -68,7 +72,9 @@ def utc_now() -> str:
 
 
 def write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def bounded(text: str | bytes | None) -> tuple[str, bool]:
@@ -106,7 +112,9 @@ def load_contract(path: Path) -> dict[str, Any]:
         raise ContractError("checks document must be a JSON object")
     if value.get("schema") != SCHEMA:
         raise ContractError(f"schema must be {SCHEMA!r}")
-    if not isinstance(value.get("checks"), list) or not isinstance(value.get("manual"), list):
+    if not isinstance(value.get("checks"), list) or not isinstance(
+        value.get("manual"), list
+    ):
         raise ContractError("checks and manual must both be arrays")
     if not value["checks"] and not value["manual"]:
         raise ContractError("no criteria found; an empty contract cannot pass")
@@ -119,7 +127,9 @@ def validate_id(value: Any, where: str) -> str:
     return value
 
 
-def validate_check(raw: Any, index: int, root: Path, allowed_risks: set[str]) -> dict[str, Any]:
+def validate_check(
+    raw: Any, index: int, root: Path, allowed_risks: set[str]
+) -> dict[str, Any]:
     where = f"checks[{index}]"
     if not isinstance(raw, dict):
         raise ContractError(f"{where} must be an object")
@@ -128,12 +138,22 @@ def validate_check(raw: Any, index: int, root: Path, allowed_risks: set[str]) ->
     if not isinstance(description, str) or not description.strip():
         raise ContractError(f"{where}.description must be a non-empty string")
     argv = raw.get("argv")
-    if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) and arg for arg in argv):
-        raise ContractError(f"{where}.argv must be a non-empty string array; freeform command strings are forbidden")
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(arg, str) and arg for arg in argv)
+    ):
+        raise ContractError(
+            f"{where}.argv must be a non-empty string array; freeform command strings are forbidden"
+        )
     executable = Path(argv[0]).name.lower()
     if executable in BLOCKED_EXECUTABLES:
-        raise ContractError(f"{where}.argv uses blocked executable {executable!r}; run side effects through the host directly")
-    if executable.startswith(("python", "node", "ruby", "perl")) and any(flag in INLINE_CODE_FLAGS for flag in argv[1:]):
+        raise ContractError(
+            f"{where}.argv uses blocked executable {executable!r}; run side effects through the host directly"
+        )
+    if executable.startswith(("python", "node", "ruby", "perl")) and any(
+        flag in INLINE_CODE_FLAGS for flag in argv[1:]
+    ):
         raise ContractError(f"{where}.argv may not use inline interpreter code")
     risk = raw.get("risk", "workspace-local")
     if risk not in {"workspace-local", "network", "external-side-effect"}:
@@ -151,19 +171,27 @@ def validate_check(raw: Any, index: int, root: Path, allowed_risks: set[str]) ->
     if not cwd.is_dir():
         raise ContractError(f"{where}.cwd does not exist: {cwd_value}")
     timeout = raw.get("timeout_seconds", 300)
-    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 0.05 <= timeout <= 3600:
+    if (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or not 0.05 <= timeout <= 3600
+    ):
         raise ContractError(f"{where}.timeout_seconds must be between 0.05 and 3600")
     expected_exit = raw.get("expected_exit", 0)
     if not isinstance(expected_exit, int) or isinstance(expected_exit, bool):
         raise ContractError(f"{where}.expected_exit must be an integer")
     patterns = raw.get("output_must_match", [])
-    if not isinstance(patterns, list) or not all(isinstance(pattern, str) for pattern in patterns):
+    if not isinstance(patterns, list) or not all(
+        isinstance(pattern, str) for pattern in patterns
+    ):
         raise ContractError(f"{where}.output_must_match must be a string array")
     for pattern in patterns:
         try:
             re.compile(pattern)
         except re.error as exc:
-            raise ContractError(f"{where}.output_must_match contains invalid regex: {exc}") from exc
+            raise ContractError(
+                f"{where}.output_must_match contains invalid regex: {exc}"
+            ) from exc
     return {
         "id": check_id,
         "description": description.strip(),
@@ -190,7 +218,12 @@ def validate_manual(raw: Any, index: int) -> dict[str, Any]:
         raise ContractError(f"{where}.status must be open or attested")
     if status == "attested" and (not raw.get("attested_by") or not raw.get("evidence")):
         raise ContractError(f"{where} attestation requires attested_by and evidence")
-    return {**raw, "id": criterion_id, "description": description.strip(), "status": status}
+    return {
+        **raw,
+        "id": criterion_id,
+        "description": description.strip(),
+        "status": status,
+    }
 
 
 def execute_check(check: dict[str, Any]) -> dict[str, Any]:
@@ -209,7 +242,11 @@ def execute_check(check: dict[str, Any]) -> dict[str, Any]:
         stdout, stdout_truncated = bounded(result.stdout)
         stderr, stderr_truncated = bounded(result.stderr)
         combined = stdout + "\n" + stderr
-        missing_patterns = [pattern for pattern in check["output_must_match"] if re.search(pattern, combined) is None]
+        missing_patterns = [
+            pattern
+            for pattern in check["output_must_match"]
+            if re.search(pattern, combined) is None
+        ]
         passed = result.returncode == check["expected_exit"] and not missing_patterns
         terminal = "pass" if passed else "fail"
         returncode: int | None = result.returncode
@@ -256,7 +293,9 @@ def print_result(result: dict[str, Any]) -> None:
     if result["error"]:
         print(f"         ! {result['error']}")
     if result["missing_output_patterns"]:
-        print(f"         ! missing output patterns: {result['missing_output_patterns']}")
+        print(
+            f"         ! missing output patterns: {result['missing_output_patterns']}"
+        )
 
 
 def main() -> int:
@@ -265,8 +304,13 @@ def main() -> int:
         checks_path, episode, root = resolve_target(args.target)
         contract = load_contract(checks_path)
         allowed_risks = {"workspace-local", *args.allow_risk}
-        checks = [validate_check(raw, index, root, allowed_risks) for index, raw in enumerate(contract["checks"])]
-        manual = [validate_manual(raw, index) for index, raw in enumerate(contract["manual"])]
+        checks = [
+            validate_check(raw, index, root, allowed_risks)
+            for index, raw in enumerate(contract["checks"])
+        ]
+        manual = [
+            validate_manual(raw, index) for index, raw in enumerate(contract["manual"])
+        ]
     except ContractError as exc:
         print(f"verify-contract: schema error: {exc}", file=sys.stderr)
         return 2
@@ -290,7 +334,9 @@ def main() -> int:
         print_result(result)
         write_json(evidence_dir / f"check-{check['id']}.json", result)
 
-    manual_open = [criterion for criterion in manual if criterion["status"] != "attested"]
+    manual_open = [
+        criterion for criterion in manual if criterion["status"] != "attested"
+    ]
     for criterion in manual:
         label = "MANUAL ok" if criterion["status"] == "attested" else "MANUAL --"
         print(f"{label:<9} {criterion['description']} [{criterion['id']}]")
@@ -319,10 +365,16 @@ def main() -> int:
         f"{len(manual) - len(manual_open)} manual attested, {len(manual_open)} manual open"
     )
     if closeout_passed:
-        print("result: PASS" if not manual_open else "result: PASS (manual criteria explicitly allowed open)")
+        print(
+            "result: PASS"
+            if not manual_open
+            else "result: PASS (manual criteria explicitly allowed open)"
+        )
         return 0
     if manual_open and failed == 0:
-        print("result: FAIL — manual criteria remain open; close-out is strict by default")
+        print(
+            "result: FAIL — manual criteria remain open; close-out is strict by default"
+        )
     else:
         print("result: FAIL")
     return 1

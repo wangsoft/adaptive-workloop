@@ -15,9 +15,20 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRIPT_NAMES = ("probe-capabilities", "create-episode", "verify-contract", "episode-state", "run-evals", "check")
+SCRIPT_NAMES = (
+    "probe-capabilities",
+    "create-episode",
+    "verify-contract",
+    "episode-state",
+    "check-episode",
+    "run-evals",
+    "check",
+)
+PYTHON_MODULES = ("workloop_core.py",)
 LEGACY_PATTERNS = {
-    "legacy executable Markdown contract": re.compile(r"desc\s*::\s*(?:command|cmd)|- \[ \].*::"),
+    "legacy executable Markdown contract": re.compile(
+        r"desc\s*::\s*(?:command|cmd)|- \[ \].*::"
+    ),
     "legacy episode directory": re.compile(r"\.workloop/episodes"),
     "legacy strict flag": re.compile(r"verify-contract[^\n]*--strict"),
     "obsolete Bash-only compatibility": re.compile(r"bash 3\.2", re.IGNORECASE),
@@ -30,7 +41,9 @@ def fail(message: str) -> None:
 
 
 def run(*argv: str, env: dict[str, str] | None = None) -> None:
-    result = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True, check=False, env=env)
+    result = subprocess.run(
+        argv, cwd=ROOT, text=True, capture_output=True, check=False, env=env
+    )
     if result.returncode != 0:
         print(result.stdout, end="")
         print(result.stderr, end="", file=sys.stderr)
@@ -49,7 +62,9 @@ def validate_frontmatter() -> None:
     if not re.search(r"(?m)^description: \".+\"$", frontmatter):
         fail("SKILL.md needs a one-line quoted description")
     if re.search(r"(?m)^compatibility:", frontmatter):
-        fail("top-level compatibility is not accepted by the Codex validator; keep it in metadata")
+        fail(
+            "top-level compatibility is not accepted by the Codex validator; keep it in metadata"
+        )
     if len(skill.splitlines()) > 500 or len(skill.split()) > 5000:
         fail("SKILL.md exceeds progressive-disclosure budget")
     openai_yaml = ROOT / "agents" / "openai.yaml"
@@ -64,23 +79,40 @@ def validate_frontmatter() -> None:
 
 def validate_json() -> None:
     paths = sorted((ROOT / "evals").glob("*.json"))
-    paths.extend([ROOT / "assets" / "checks.json", ROOT / "references" / "model-deltas.json"])
+    paths.extend(
+        [ROOT / "assets" / "checks.json", ROOT / "references" / "model-deltas.json"]
+    )
     for path in paths:
         try:
             json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             fail(f"invalid JSON in {path.relative_to(ROOT)}: {exc}")
-    ledger = json.loads((ROOT / "references" / "model-deltas.json").read_text(encoding="utf-8"))
-    if ledger.get("schema") != "workloop-model-deltas/1" or not isinstance(ledger.get("entries"), list):
+    ledger = json.loads(
+        (ROOT / "references" / "model-deltas.json").read_text(encoding="utf-8")
+    )
+    if ledger.get("schema") != "workloop-model-deltas/1" or not isinstance(
+        ledger.get("entries"), list
+    ):
         fail("model-deltas.json has an invalid schema")
     for entry in ledger["entries"]:
-        required = {"id", "model_pattern", "host_pattern", "observed", "evidence", "counter_instruction", "status", "retest_by"}
+        required = {
+            "id",
+            "model_pattern",
+            "host_pattern",
+            "observed",
+            "evidence",
+            "counter_instruction",
+            "status",
+            "retest_by",
+        }
         if not isinstance(entry, dict) or not required.issubset(entry):
             fail("model-deltas.json entry is missing required fields")
         if entry["status"] not in {"active", "retired"}:
             fail(f"model delta {entry['id']} has invalid status")
         if len(str(entry["counter_instruction"]).splitlines()) > 3:
-            fail(f"model delta {entry['id']} exceeds the three-line counter-instruction limit")
+            fail(
+                f"model delta {entry['id']} exceeds the three-line counter-instruction limit"
+            )
         if not isinstance(entry["evidence"], list) or len(entry["evidence"]) < 1:
             fail(f"model delta {entry['id']} has no evidence")
         try:
@@ -100,8 +132,23 @@ def validate_scripts() -> None:
                 fail(f"missing script: scripts/{name}")
             if not os.access(path, os.X_OK):
                 fail(f"script is not executable: scripts/{name}")
-            if path.read_text(encoding="utf-8").splitlines()[0] != "#!/usr/bin/env python3":
+            if (
+                path.read_text(encoding="utf-8").splitlines()[0]
+                != "#!/usr/bin/env python3"
+            ):
                 fail(f"unexpected interpreter: scripts/{name}")
+            try:
+                py_compile.compile(
+                    str(path),
+                    cfile=str(compile_dir / f"{name}.pyc"),
+                    doraise=True,
+                )
+            except py_compile.PyCompileError as exc:
+                fail(str(exc))
+        for name in PYTHON_MODULES:
+            path = ROOT / "scripts" / name
+            if not path.is_file():
+                fail(f"missing module: scripts/{name}")
             try:
                 py_compile.compile(
                     str(path),

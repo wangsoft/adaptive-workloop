@@ -1,8 +1,17 @@
 .DS_Store
 __pycache__/
+.ruff_cache/
 *.py[cod]
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
 evals/runs/
 .workloop/local/
 .workloop/tracked/*/runtime.json
 .workloop/tracked/*/capabilities.json
 .workloop/tracked/*/evidence/
+.workloop/tracked/*/.state.lock
