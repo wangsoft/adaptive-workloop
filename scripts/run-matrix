@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""Run a resumable bare/previous/candidate evaluation matrix."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+sys.dont_write_bytecode = True
+from workloop_core import (  # noqa: E402
+    BoundedCommandError,
+    adapter_runtime_digest,
+    canonical_json_digest,
+    file_digest,
+    run_bounded_command,
+    skill_runtime_digest,
+)
+
+
+CONDITIONS = ("bare", "previous", "candidate")
+REVIEWED_SUITES = {"behavior", "regression"}
+SAFE_ENV = ("LANG", "LC_ALL", "LC_CTYPE", "PATH", "TEMP", "TMP", "TMPDIR")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class MatrixError(ValueError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--suite",
+        required=True,
+        choices=("trigger", "behavior", "regression", "standalone"),
+    )
+    parser.add_argument("--dataset", type=Path)
+    parser.add_argument("--evidence-class", choices=("public", "held-in", "held-out"))
+    parser.add_argument("--case", action="append", default=[])
+    parser.add_argument("--adapter", required=True, type=Path)
+    parser.add_argument("--grader", type=Path)
+    parser.add_argument("--grader-profile", default="unspecified")
+    parser.add_argument("--previous-skill", required=True, type=Path)
+    parser.add_argument("--model-profile", default="unspecified")
+    parser.add_argument("--host-profile")
+    parser.add_argument("--trials", type=int, default=1)
+    parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument("--max-output-bytes", type=int, default=1024 * 1024)
+    parser.add_argument("--stage-timeout", type=float, default=7200)
+    parser.add_argument("--stage-max-output-bytes", type=int, default=4 * 1024 * 1024)
+    parser.add_argument("--pass-env", action="append", default=[], metavar="NAME")
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--resume", action="store_true")
+    return parser.parse_args()
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MatrixError(f"{path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise MatrixError(f"{path}: root must be an object")
+    return value
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def selected_environment(requested: list[str]) -> tuple[dict[str, str], list[str]]:
+    invalid = [name for name in requested if not ENV_NAME_RE.fullmatch(name)]
+    if invalid:
+        raise MatrixError(f"invalid --pass-env names: {sorted(set(invalid))}")
+    missing = [name for name in requested if name not in os.environ]
+    if missing:
+        raise MatrixError(f"--pass-env names are not set: {sorted(set(missing))}")
+    environment = {name: os.environ[name] for name in SAFE_ENV if name in os.environ}
+    passed = sorted(set(requested))
+    for name in passed:
+        environment[name] = os.environ[name]
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment, passed
+
+
+def dataset_binding(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    if args.dataset is None:
+        if args.evidence_class not in {None, "public"}:
+            raise MatrixError("repository datasets are public and cannot be held-out")
+        path = root / "evals" / f"{args.suite}-cases.json"
+        evidence_class = "public"
+        origin = "repository"
+    else:
+        if args.evidence_class is None:
+            raise MatrixError("external --dataset requires --evidence-class")
+        path = args.dataset.expanduser().resolve()
+        evidence_class = args.evidence_class
+        origin = "external"
+    if not path.is_file():
+        raise MatrixError(f"dataset not found: {path}")
+    value = load_json(path)
+    if value.get("suite") != f"adaptive-workloop/{args.suite}":
+        raise MatrixError("dataset suite label mismatch")
+    if origin == "external" and (
+        value.get("evidence_class") != evidence_class
+        or value.get("held_out") is not (evidence_class == "held-out")
+    ):
+        raise MatrixError("external dataset evidence class binding mismatch")
+    return {
+        "path": str(path.resolve()),
+        "digest": file_digest(path),
+        "evidence_class": evidence_class,
+        "origin": origin,
+        "held_out": evidence_class == "held-out",
+    }
+
+
+def executable_binding(path: Path, label: str) -> dict[str, str]:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise MatrixError(f"{label} is not executable: {resolved}")
+    return {"path": str(resolved), "digest": adapter_runtime_digest(resolved)}
+
+
+def build_manifest(
+    root: Path, args: argparse.Namespace, passed_env: list[str]
+) -> dict[str, Any]:
+    previous = args.previous_skill.expanduser().resolve()
+    if not (previous / "SKILL.md").is_file():
+        raise MatrixError(f"previous Skill checkout is invalid: {previous}")
+    if args.trials < 1 or args.timeout <= 0 or args.stage_timeout <= 0:
+        raise MatrixError("trial counts and timeouts must be positive")
+    if args.max_output_bytes < 1024 or args.stage_max_output_bytes < 1024:
+        raise MatrixError("output limits must be at least 1024 bytes")
+    adapter = executable_binding(args.adapter, "adapter")
+    grader = executable_binding(args.grader, "grader") if args.grader else None
+    if args.suite in REVIEWED_SUITES and grader is None:
+        raise MatrixError(f"suite {args.suite} requires --grader")
+    if args.suite not in REVIEWED_SUITES and grader is not None:
+        raise MatrixError(f"suite {args.suite} does not use --grader")
+    scripts = {
+        name: file_digest(root / "scripts" / name)
+        for name in ("run-matrix", "run-evals", "grade-evals", "compare-evals")
+    }
+    manifest = {
+        "schema": "workloop-eval-matrix/1",
+        "created_at": utc_now(),
+        "configuration": {
+            "suite": args.suite,
+            "cases": args.case,
+            "trials": args.trials,
+            "model_profile": args.model_profile,
+            "host_profile": args.host_profile,
+            "grader_profile": args.grader_profile if grader else None,
+            "timeout_seconds": args.timeout,
+            "max_output_bytes": args.max_output_bytes,
+            "stage_timeout_seconds": args.stage_timeout,
+            "stage_max_output_bytes": args.stage_max_output_bytes,
+            "passed_environment_names": passed_env,
+        },
+        "bindings": {
+            "dataset": dataset_binding(root, args),
+            "adapter": adapter,
+            "grader": grader,
+            "skills": {
+                "bare": None,
+                "previous": {
+                    "path": str(previous),
+                    "digest": skill_runtime_digest(previous),
+                },
+                "candidate": {
+                    "path": str(root.resolve()),
+                    "digest": skill_runtime_digest(root),
+                },
+            },
+            "scripts": scripts,
+        },
+    }
+    manifest["digest"] = canonical_json_digest(manifest)
+    return manifest
+
+
+def compatible_manifest(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
+    return (
+        actual.get("schema") == "workloop-eval-matrix/1"
+        and actual.get("digest") == canonical_json_digest(actual, omit={"digest"})
+        and actual.get("configuration") == expected["configuration"]
+        and actual.get("bindings") == expected["bindings"]
+    )
+
+
+def load_events(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    events = []
+    previous_digest = None
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise MatrixError(f"events.jsonl line {line_number}: {exc}") from exc
+        if (
+            not isinstance(event, dict)
+            or event.get("seq") != line_number
+            or event.get("previous_digest") != previous_digest
+            or event.get("digest") != canonical_json_digest(event, omit={"digest"})
+        ):
+            raise MatrixError(f"events.jsonl line {line_number} breaks the event chain")
+        events.append(event)
+        previous_digest = event["digest"]
+    return events
+
+
+def append_event(path: Path, events: list[dict[str, Any]], **fields: Any) -> None:
+    event = {
+        "seq": len(events) + 1,
+        "at": utc_now(),
+        "previous_digest": events[-1]["digest"] if events else None,
+        **fields,
+    }
+    event["digest"] = canonical_json_digest(event)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    events.append(event)
+
+
+def next_attempt(parent: Path, suffix: str = "") -> Path:
+    parent.mkdir(parents=True, exist_ok=True)
+    used = []
+    for path in parent.glob(f"attempt-*{suffix}"):
+        match = re.fullmatch(rf"attempt-([0-9]+){re.escape(suffix)}", path.name)
+        if match:
+            used.append(int(match.group(1)))
+    return parent / f"attempt-{max(used, default=0) + 1:03d}{suffix}"
+
+
+def run_stage_command(
+    *,
+    argv: list[str],
+    environment: dict[str, str],
+    timeout: float,
+    output_limit: int,
+    log_prefix: Path,
+) -> int:
+    command_digest = canonical_json_digest({"argv": argv})
+    try:
+        result = run_bounded_command(
+            argv,
+            input_bytes=b"",
+            environment=environment,
+            timeout_seconds=timeout,
+            max_output_bytes=output_limit,
+        )
+    except BoundedCommandError as exc:
+        raise MatrixError(f"stage command {command_digest} {exc.kind}: {exc}") from exc
+    log_prefix.parent.mkdir(parents=True, exist_ok=True)
+    (log_prefix.parent / f"{log_prefix.name}.stdout.txt").write_text(
+        result.stdout, encoding="utf-8"
+    )
+    (log_prefix.parent / f"{log_prefix.name}.stderr.txt").write_text(
+        result.stderr, encoding="utf-8"
+    )
+    return result.returncode
+
+
+def valid_run(path: Path, condition: str, manifest: dict[str, Any]) -> bool:
+    try:
+        run_manifest = load_json(path / "run-manifest.json")
+        summary = load_json(path / "summary.json")
+    except MatrixError:
+        return False
+    dataset = manifest["bindings"]["dataset"]
+    return (
+        run_manifest.get("digest")
+        == canonical_json_digest(run_manifest, omit={"digest"})
+        and summary.get("digest") == canonical_json_digest(summary, omit={"digest"})
+        and summary.get("run_manifest_digest") == run_manifest.get("digest")
+        and run_manifest.get("condition") == condition
+        and run_manifest.get("model_profile")
+        == manifest["configuration"]["model_profile"]
+        and run_manifest.get("dataset", {}).get("digest") == dataset["digest"]
+        and run_manifest.get("dataset", {}).get("evidence_class")
+        == dataset["evidence_class"]
+        and summary.get("errors") == 0
+    )
+
+
+def valid_review(path: Path) -> bool:
+    try:
+        run_manifest = load_json(path / "run-manifest.json")
+        review = load_json(path / "review-summary.json")
+    except MatrixError:
+        return False
+    return (
+        review.get("digest") == canonical_json_digest(review, omit={"digest"})
+        and review.get("source_run_manifest_digest") == run_manifest.get("digest")
+        and review.get("errors") == 0
+        and review.get("needs_human") == 0
+    )
+
+
+def completed_artifact(
+    output: Path,
+    events: list[dict[str, Any]],
+    stage: str,
+    validator: Any,
+) -> Path | None:
+    for event in reversed(events):
+        if event.get("stage") != stage or event.get("status") != "completed":
+            continue
+        artifact = event.get("artifact")
+        if not isinstance(artifact, str):
+            continue
+        path = (output / artifact).resolve()
+        try:
+            path.relative_to(output)
+        except ValueError:
+            continue
+        if not validator(path):
+            continue
+        try:
+            if stage.startswith("run-"):
+                actual_digest = load_json(path / "run-manifest.json")["digest"]
+            elif stage.startswith("grade-"):
+                actual_digest = load_json(path / "review-summary.json")["digest"]
+            else:
+                actual_digest = load_json(path)["digest"]
+        except (KeyError, MatrixError):
+            continue
+        if event.get("artifact_digest") == actual_digest:
+            return path
+    return None
+
+
+def run_condition(
+    *,
+    root: Path,
+    output: Path,
+    args: argparse.Namespace,
+    manifest: dict[str, Any],
+    environment: dict[str, str],
+    events: list[dict[str, Any]],
+    condition: str,
+) -> Path:
+    grade_stage = f"grade-{condition}"
+    if args.suite in REVIEWED_SUITES:
+        reviewed = completed_artifact(output, events, grade_stage, valid_review)
+        if reviewed is not None and valid_run(reviewed, condition, manifest):
+            return reviewed
+
+    run_stage = f"run-{condition}"
+    run_dir = completed_artifact(
+        output,
+        events,
+        run_stage,
+        lambda path: (
+            valid_run(path, condition, manifest)
+            and not (path / "reviews").exists()
+            and not (path / "review-summary.json").exists()
+        ),
+    )
+    if run_dir is None:
+        run_dir = next_attempt(output / "runs" / condition)
+        relative = run_dir.relative_to(output).as_posix()
+        command = [
+            str(root / "scripts" / "run-evals"),
+            "--suite",
+            args.suite,
+            "--condition",
+            condition,
+            "--adapter",
+            manifest["bindings"]["adapter"]["path"],
+            "--model-profile",
+            args.model_profile,
+            "--trials",
+            str(args.trials),
+            "--timeout",
+            str(args.timeout),
+            "--max-output-bytes",
+            str(args.max_output_bytes),
+            "--output",
+            str(run_dir),
+        ]
+        if args.dataset is not None:
+            command.extend(
+                [
+                    "--dataset",
+                    manifest["bindings"]["dataset"]["path"],
+                    "--evidence-class",
+                    manifest["bindings"]["dataset"]["evidence_class"],
+                ]
+            )
+        if args.host_profile:
+            command.extend(["--host-profile", args.host_profile])
+        for case_id in args.case:
+            command.extend(["--case", case_id])
+        if condition == "previous":
+            command.extend(
+                ["--previous-skill", manifest["bindings"]["skills"]["previous"]["path"]]
+            )
+        if args.suite in REVIEWED_SUITES:
+            command.append("--allow-review-required")
+        for name in manifest["configuration"]["passed_environment_names"]:
+            command.extend(["--pass-env", name])
+        append_event(
+            output / "events.jsonl",
+            events,
+            stage=run_stage,
+            status="started",
+            artifact=relative,
+            command_digest=canonical_json_digest({"argv": command}),
+        )
+        try:
+            returncode = run_stage_command(
+                argv=command,
+                environment=environment,
+                timeout=args.stage_timeout,
+                output_limit=args.stage_max_output_bytes,
+                log_prefix=output / "logs" / f"{run_stage}-{run_dir.name}",
+            )
+            if not valid_run(run_dir, condition, manifest):
+                raise MatrixError(f"{run_stage} produced invalid or errored evidence")
+            if returncode not in {0, 1}:
+                raise MatrixError(f"{run_stage} exited {returncode}")
+        except MatrixError as exc:
+            append_event(
+                output / "events.jsonl",
+                events,
+                stage=run_stage,
+                status="failed",
+                artifact=relative,
+                error=str(exc),
+            )
+            raise
+        append_event(
+            output / "events.jsonl",
+            events,
+            stage=run_stage,
+            status="completed",
+            artifact=relative,
+            artifact_digest=load_json(run_dir / "run-manifest.json")["digest"],
+        )
+
+    if args.suite not in REVIEWED_SUITES:
+        return run_dir
+
+    relative = run_dir.relative_to(output).as_posix()
+    command = [
+        str(root / "scripts" / "grade-evals"),
+        "--run",
+        str(run_dir),
+        "--grader",
+        manifest["bindings"]["grader"]["path"],
+        "--grader-profile",
+        args.grader_profile,
+        "--timeout",
+        str(args.timeout),
+        "--max-output-bytes",
+        str(args.max_output_bytes),
+    ]
+    if args.dataset is not None:
+        command.extend(["--dataset", manifest["bindings"]["dataset"]["path"]])
+    for name in manifest["configuration"]["passed_environment_names"]:
+        command.extend(["--pass-env", name])
+    append_event(
+        output / "events.jsonl",
+        events,
+        stage=grade_stage,
+        status="started",
+        artifact=relative,
+        command_digest=canonical_json_digest({"argv": command}),
+    )
+    try:
+        returncode = run_stage_command(
+            argv=command,
+            environment=environment,
+            timeout=args.stage_timeout,
+            output_limit=args.stage_max_output_bytes,
+            log_prefix=output / "logs" / f"{grade_stage}-{run_dir.name}",
+        )
+        if returncode == 3:
+            raise MatrixError(f"{grade_stage} requires human review")
+        if returncode not in {0, 1} or not valid_review(run_dir):
+            raise MatrixError(f"{grade_stage} produced invalid or incomplete evidence")
+    except MatrixError as exc:
+        append_event(
+            output / "events.jsonl",
+            events,
+            stage=grade_stage,
+            status="failed",
+            artifact=relative,
+            error=str(exc),
+        )
+        raise
+    review = load_json(run_dir / "review-summary.json")
+    append_event(
+        output / "events.jsonl",
+        events,
+        stage=grade_stage,
+        status="completed",
+        artifact=relative,
+        artifact_digest=review["digest"],
+    )
+    return run_dir
+
+
+def valid_comparison(path: Path) -> bool:
+    try:
+        report = load_json(path)
+    except MatrixError:
+        return False
+    return (
+        report.get("schema") == "workloop-eval-comparison/1"
+        and report.get("digest") == canonical_json_digest(report, omit={"digest"})
+        and set(report.get("conditions", {})) == set(CONDITIONS)
+    )
+
+
+def compare_runs(
+    *,
+    root: Path,
+    output: Path,
+    args: argparse.Namespace,
+    environment: dict[str, str],
+    events: list[dict[str, Any]],
+    runs: dict[str, Path],
+) -> Path:
+    existing = completed_artifact(output, events, "compare", valid_comparison)
+    if existing is not None:
+        return existing
+    comparison = next_attempt(output / "comparisons", ".json")
+    relative = comparison.relative_to(output).as_posix()
+    command = [
+        str(root / "scripts" / "compare-evals"),
+        "--bare",
+        str(runs["bare"]),
+        "--previous",
+        str(runs["previous"]),
+        "--candidate",
+        str(runs["candidate"]),
+        "--output",
+        str(comparison),
+    ]
+    append_event(
+        output / "events.jsonl",
+        events,
+        stage="compare",
+        status="started",
+        artifact=relative,
+        command_digest=canonical_json_digest({"argv": command}),
+    )
+    try:
+        returncode = run_stage_command(
+            argv=command,
+            environment=environment,
+            timeout=args.stage_timeout,
+            output_limit=args.stage_max_output_bytes,
+            log_prefix=output / "logs" / f"compare-{comparison.stem}",
+        )
+        if returncode != 0 or not valid_comparison(comparison):
+            raise MatrixError("compare produced invalid evidence")
+    except MatrixError as exc:
+        append_event(
+            output / "events.jsonl",
+            events,
+            stage="compare",
+            status="failed",
+            artifact=relative,
+            error=str(exc),
+        )
+        raise
+    report = load_json(comparison)
+    append_event(
+        output / "events.jsonl",
+        events,
+        stage="compare",
+        status="completed",
+        artifact=relative,
+        artifact_digest=report["digest"],
+    )
+    return comparison
+
+
+def main() -> int:
+    args = parse_args()
+    root = Path(__file__).resolve().parent.parent
+    output = args.output.expanduser().resolve()
+    try:
+        environment, passed_env = selected_environment(args.pass_env)
+        expected_manifest = build_manifest(root, args, passed_env)
+        manifest_path = output / "matrix-manifest.json"
+        if args.resume:
+            if not manifest_path.is_file():
+                raise MatrixError("--resume requires an existing matrix-manifest.json")
+            manifest = load_json(manifest_path)
+            if not compatible_manifest(manifest, expected_manifest):
+                raise MatrixError("resume configuration or bound evidence has changed")
+        else:
+            if output.exists() and any(output.iterdir()):
+                raise MatrixError(f"output directory is not empty: {output}")
+            output.mkdir(parents=True, exist_ok=True)
+            manifest = expected_manifest
+            write_json(manifest_path, manifest)
+        events = load_events(output / "events.jsonl")
+        runs = {
+            condition: run_condition(
+                root=root,
+                output=output,
+                args=args,
+                manifest=manifest,
+                environment=environment,
+                events=events,
+                condition=condition,
+            )
+            for condition in CONDITIONS
+        }
+        comparison = compare_runs(
+            root=root,
+            output=output,
+            args=args,
+            environment=environment,
+            events=events,
+            runs=runs,
+        )
+        result_path = output / "matrix-result.json"
+        result = {
+            "schema": "workloop-eval-matrix-result/1",
+            "matrix_manifest_digest": manifest["digest"],
+            "runs": {
+                condition: {
+                    "path": path.relative_to(output).as_posix(),
+                    "manifest_digest": load_json(path / "run-manifest.json")["digest"],
+                    "review_digest": (
+                        load_json(path / "review-summary.json")["digest"]
+                        if (path / "review-summary.json").is_file()
+                        else None
+                    ),
+                }
+                for condition, path in runs.items()
+            },
+            "comparison": {
+                "path": comparison.relative_to(output).as_posix(),
+                "digest": load_json(comparison)["digest"],
+            },
+        }
+        result["digest"] = canonical_json_digest(result)
+        if result_path.exists() and load_json(result_path) != result:
+            raise MatrixError(
+                "existing matrix-result.json does not match resumed evidence"
+            )
+        if not result_path.exists():
+            write_json(result_path, result)
+    except MatrixError as exc:
+        print(f"run-matrix: {exc}", file=sys.stderr)
+        return 1
+    print(f"run-matrix: {output / 'matrix-result.json'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

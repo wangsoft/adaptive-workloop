@@ -113,6 +113,18 @@ def validate_source(
         raise GraderError("source summary condition/model does not match the manifest")
     if summary.get("host_profile") != manifest.get("host_profile"):
         raise GraderError("source summary host profile does not match the manifest")
+    dataset_binding = manifest.get("dataset", {})
+    summary_dataset = summary.get("dataset", {})
+    evidence_class = dataset_binding.get("evidence_class")
+    if (
+        evidence_class not in {"public", "held-in", "held-out"}
+        or dataset_binding.get("origin") not in {"repository", "external"}
+        or dataset_binding.get("held_out") is not (evidence_class == "held-out")
+        or summary_dataset.get("digest") != dataset_binding.get("digest")
+        or summary_dataset.get("evidence_class") != evidence_class
+        or summary_dataset.get("origin") != dataset_binding.get("origin")
+    ):
+        raise GraderError("source run has an invalid dataset evidence binding")
     if manifest.get("suite") not in {"behavior", "regression"}:
         raise GraderError("only behavior and regression runs use independent grading")
     if manifest.get("dataset", {}).get("suite") != manifest["suite"] or not isinstance(
@@ -125,6 +137,21 @@ def validate_source(
         raise GraderError(f"dataset not found: {dataset}")
     verify_digest(dataset, manifest.get("dataset", {}).get("digest"), "dataset")
     dataset_value = load_json(dataset)
+    declared_evidence_class = dataset_value.get("evidence_class")
+    declared_held_out = dataset_value.get("held_out")
+    if dataset_binding["origin"] == "repository":
+        if dataset_arg is not None:
+            raise GraderError("repository run must use its repository dataset")
+        if declared_evidence_class not in {None, "public"} or declared_held_out is True:
+            raise GraderError("repository dataset cannot claim hidden evidence")
+    elif dataset_arg is None:
+        raise GraderError("external source run requires --dataset")
+    elif (
+        declared_evidence_class != evidence_class
+        or not isinstance(declared_held_out, bool)
+        or declared_held_out is not (evidence_class == "held-out")
+    ):
+        raise GraderError("external dataset evidence class does not match source run")
     cases = dataset_value.get("cases")
     if not isinstance(cases, list):
         raise GraderError("dataset cases must be an array")
@@ -262,7 +289,76 @@ def run_grader(
         raise GraderError(
             "grader response must use workloop-grader-response/1 with status, rationale, and criteria"
         )
+    expected_criteria = request.get("criteria")
+    actual_criteria = response["criteria"]
+    if not isinstance(expected_criteria, list):
+        raise GraderError("grader request has invalid criteria")
+    expected_by_id = {
+        item.get("id"): item
+        for item in expected_criteria
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    actual_by_id: dict[str, dict[str, Any]] = {}
+    for item in actual_criteria:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"criterion_id", "criterion", "status", "evidence"}
+            or not isinstance(item.get("criterion_id"), str)
+            or item["criterion_id"] in actual_by_id
+            or not isinstance(item.get("criterion"), str)
+            or item.get("status") not in REVIEW_STATUSES
+            or not isinstance(item.get("evidence"), str)
+        ):
+            raise GraderError("grader response has an invalid criteria record")
+        actual_by_id[item["criterion_id"]] = item
+    if set(expected_by_id) != set(actual_by_id) or len(expected_by_id) != len(
+        expected_criteria
+    ):
+        raise GraderError("grader criteria coverage does not match the bound request")
+    for criterion_id, expected in expected_by_id.items():
+        if actual_by_id[criterion_id]["criterion"] != expected.get("expectation"):
+            raise GraderError("grader criterion text does not match the bound request")
+    statuses = {item["status"] for item in actual_criteria}
+    derived_status = (
+        "failed"
+        if "failed" in statuses
+        else "needs_human"
+        if "needs_human" in statuses
+        else "passed"
+    )
+    if response["status"] != derived_status:
+        raise GraderError("grader aggregate status is inconsistent with criteria")
     return response, result.stderr, result.duration_seconds
+
+
+def criteria_for(expected: dict[str, Any]) -> list[dict[str, str]]:
+    criteria: list[dict[str, str]] = []
+    route = expected.get("route")
+    if isinstance(route, str):
+        criteria.append(
+            {
+                "id": "route",
+                "kind": "route",
+                "expectation": f"route equals {route}",
+            }
+        )
+    for kind in ("must", "must_not"):
+        values = expected.get(kind)
+        if not isinstance(values, list):
+            raise GraderError(f"expected {kind} must be an array")
+        for index, value in enumerate(values, start=1):
+            if not isinstance(value, str) or not value:
+                raise GraderError(f"expected {kind} criteria must be non-empty strings")
+            criteria.append(
+                {
+                    "id": f"{kind}-{index:03d}",
+                    "kind": kind,
+                    "expectation": value,
+                }
+            )
+    if not criteria:
+        raise GraderError("expected output defines no grading criteria")
+    return criteria
 
 
 def main() -> int:
@@ -316,6 +412,7 @@ def main() -> int:
                 "grading_digest": source_case["grading_digest"],
             },
             "expected": cases_by_id[source_case["case_id"]]["expected"],
+            "criteria": criteria_for(cases_by_id[source_case["case_id"]]["expected"]),
             "producer_request": producer_request,
             "producer_response": producer_response,
             "producer_grading": producer_grading,

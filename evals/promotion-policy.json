@@ -1,0 +1,14 @@
+{
+  "schema": "workloop-promotion-policy/1",
+  "required_evidence_classes": [
+    "public",
+    "held-out"
+  ],
+  "min_total_trials_per_condition": 3,
+  "min_candidate_pass_rate": 0.8,
+  "min_candidate_pass_rate_delta_vs_previous": 0.0,
+  "max_candidate_losses_vs_previous": 0,
+  "max_combined_token_ratio_vs_previous": 1.5,
+  "max_combined_cost_ratio_vs_previous": null,
+  "human_approval_required": true
+}

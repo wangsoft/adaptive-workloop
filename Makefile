@@ -1,5 +1,5 @@
-PY_SCRIPTS := scripts/check scripts/check-episode scripts/compare-evals scripts/create-episode scripts/episode-state scripts/grade-evals scripts/probe-capabilities scripts/run-evals scripts/verify-contract scripts/workloop_core.py
-PY_ADAPTERS := evals/adapters/claude-code evals/adapters/codex-cli evals/adapters/provider_common.py
+PY_SCRIPTS := scripts/check scripts/check-episode scripts/compare-evals scripts/create-episode scripts/decide-promotion scripts/episode-state scripts/grade-evals scripts/probe-capabilities scripts/run-evals scripts/run-matrix scripts/verify-contract scripts/workloop_core.py
+PY_ADAPTERS := evals/adapters/claude-code evals/adapters/claude-grader evals/adapters/codex-cli evals/adapters/codex-grader evals/adapters/provider_common.py
 
 .PHONY: check test lint eval-validate
 

@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Independently grade one eval artifact through an isolated Codex CLI process."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from pathlib import Path
+
+from provider_common import (
+    GRADER_RESULT_SCHEMA,
+    ProviderAdapterError,
+    ProviderContext,
+    emit_or_fail,
+    grader_configuration,
+    grader_prompt,
+    grader_response,
+    read_grader_request,
+    run_provider_jsonl,
+    validate_grader_result,
+)
+
+
+def execute() -> tuple[dict[str, object], str]:
+    request = read_grader_request()
+    model, effort = grader_configuration(
+        {"low", "medium", "high", "xhigh", "max", "ultra"}
+    )
+    with tempfile.TemporaryDirectory(prefix="workloop-codex-grader-") as tmp:
+        workspace = Path(tmp)
+        context = ProviderContext(request, workspace, workspace, False)
+        schema_path = workspace / "grader-result.schema.json"
+        schema_path.write_text(
+            json.dumps(GRADER_RESULT_SCHEMA, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        result_path = workspace / "grader-result.json"
+        binary = os.environ.get("WORKLOOP_CODEX_BIN", "codex")
+        argv = [
+            binary,
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--sandbox",
+            "read-only",
+            "-C",
+            str(workspace),
+            "--skip-git-repo-check",
+            "--output-schema",
+            str(schema_path),
+            "--json",
+            "-o",
+            str(result_path),
+            "--model",
+            model,
+            "-c",
+            f'model_reasoning_effort="{effort}"',
+            "-",
+        ]
+        execution = run_provider_jsonl(
+            argv,
+            context,
+            grader_prompt(request),
+            environment_names={
+                "ALL_PROXY",
+                "CODEX_HOME",
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "NO_PROXY",
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+                "OPENAI_ORG_ID",
+                "OPENAI_PROJECT_ID",
+                "REQUESTS_CA_BUNDLE",
+                "SSL_CERT_FILE",
+            },
+        )
+        if not result_path.is_file():
+            raise ProviderAdapterError("Codex did not write the grader result file")
+        try:
+            result = validate_grader_result(
+                json.loads(result_path.read_text(encoding="utf-8"))
+            )
+        except json.JSONDecodeError as exc:
+            raise ProviderAdapterError(
+                f"Codex grader result is invalid JSON: {exc}"
+            ) from exc
+        response = grader_response(
+            host="codex",
+            model=model,
+            effort=effort,
+            execution=execution,
+            result=result,
+        )
+        return response, execution.stderr
+
+
+emit_or_fail(execute)

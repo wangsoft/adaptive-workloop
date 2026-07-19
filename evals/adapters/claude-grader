@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Independently grade one eval artifact through an isolated Claude Code process."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from pathlib import Path
+
+from provider_common import (
+    GRADER_RESULT_SCHEMA,
+    ProviderAdapterError,
+    ProviderContext,
+    emit_or_fail,
+    grader_configuration,
+    grader_prompt,
+    grader_response,
+    read_grader_request,
+    run_provider_jsonl,
+    validate_grader_result,
+)
+
+
+def execute() -> tuple[dict[str, object], str]:
+    request = read_grader_request()
+    model, effort = grader_configuration({"low", "medium", "high", "xhigh", "max"})
+    with tempfile.TemporaryDirectory(prefix="workloop-claude-grader-") as tmp:
+        workspace = Path(tmp)
+        context = ProviderContext(request, workspace, workspace, False)
+        binary = os.environ.get("WORKLOOP_CLAUDE_BIN", "claude")
+        argv = [
+            binary,
+            "-p",
+            "--bare",
+            "--disable-slash-commands",
+            "--output-format",
+            "stream-json",
+            "--json-schema",
+            json.dumps(GRADER_RESULT_SCHEMA, sort_keys=True, separators=(",", ":")),
+            "--model",
+            model,
+            "--effort",
+            effort,
+            "--no-session-persistence",
+            "--strict-mcp-config",
+            "--mcp-config",
+            "{}",
+            "--permission-mode",
+            "dontAsk",
+            "--tools",
+            "",
+            "--verbose",
+        ]
+        execution = run_provider_jsonl(
+            argv,
+            context,
+            grader_prompt(request),
+            environment_names={
+                "ALL_PROXY",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_VERTEX_PROJECT_ID",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_DEFAULT_REGION",
+                "AWS_PROFILE",
+                "AWS_REGION",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDE_CODE_USE_VERTEX",
+                "CLOUD_ML_REGION",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "NO_PROXY",
+                "REQUESTS_CA_BUNDLE",
+                "SSL_CERT_FILE",
+            },
+        )
+        result = None
+        for event in reversed(execution.events):
+            structured = event.get("structured_output")
+            if isinstance(structured, dict):
+                result = validate_grader_result(structured)
+                break
+        if result is None:
+            raise ProviderAdapterError(
+                "Claude Code returned no structured grader output"
+            )
+        response = grader_response(
+            host="claude-code",
+            model=model,
+            effort=effort,
+            execution=execution,
+            result=result,
+        )
+        return response, execution.stderr
+
+
+emit_or_fail(execute)

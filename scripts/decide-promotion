@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Apply a fail-closed promotion policy to bound eval comparisons."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from pathlib import Path
+from typing import Any
+
+sys.dont_write_bytecode = True
+from workloop_core import canonical_json_digest, file_digest  # noqa: E402
+
+
+EVIDENCE_CLASSES = {"public", "held-in", "held-out"}
+
+
+class PromotionError(ValueError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--policy", required=True, type=Path)
+    parser.add_argument("--comparison", required=True, action="append", type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    return parser.parse_args()
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PromotionError(f"{path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise PromotionError(f"{path}: root must be an object")
+    return value
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def number(value: Any, label: str, *, minimum: float | None = None) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+    ):
+        raise PromotionError(f"policy {label} must be a finite number")
+    result = float(value)
+    if minimum is not None and result < minimum:
+        raise PromotionError(f"policy {label} must be at least {minimum:g}")
+    return result
+
+
+def validate_policy(value: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "schema",
+        "required_evidence_classes",
+        "min_total_trials_per_condition",
+        "min_candidate_pass_rate",
+        "min_candidate_pass_rate_delta_vs_previous",
+        "max_candidate_losses_vs_previous",
+        "max_combined_token_ratio_vs_previous",
+        "max_combined_cost_ratio_vs_previous",
+        "human_approval_required",
+    }
+    if value.get("schema") != "workloop-promotion-policy/1" or set(value) != allowed:
+        raise PromotionError("policy fields do not match workloop-promotion-policy/1")
+    classes = value.get("required_evidence_classes")
+    if (
+        not isinstance(classes, list)
+        or not classes
+        or len(classes) != len(set(classes))
+        or any(item not in EVIDENCE_CLASSES for item in classes)
+    ):
+        raise PromotionError("policy required_evidence_classes is invalid")
+    integer_fields = (
+        "min_total_trials_per_condition",
+        "max_candidate_losses_vs_previous",
+    )
+    for field in integer_fields:
+        field_value = value.get(field)
+        if (
+            not isinstance(field_value, int)
+            or isinstance(field_value, bool)
+            or field_value < (1 if field.startswith("min_") else 0)
+        ):
+            raise PromotionError(f"policy {field} is invalid")
+    pass_rate = number(value.get("min_candidate_pass_rate"), "min_candidate_pass_rate")
+    if not 0 <= pass_rate <= 1:
+        raise PromotionError("policy min_candidate_pass_rate must be between 0 and 1")
+    delta = number(
+        value.get("min_candidate_pass_rate_delta_vs_previous"),
+        "min_candidate_pass_rate_delta_vs_previous",
+    )
+    if not -1 <= delta <= 1:
+        raise PromotionError("policy pass-rate delta must be between -1 and 1")
+    number(
+        value.get("max_combined_token_ratio_vs_previous"),
+        "max_combined_token_ratio_vs_previous",
+        minimum=0,
+    )
+    cost_ratio = value.get("max_combined_cost_ratio_vs_previous")
+    if cost_ratio is not None:
+        number(cost_ratio, "max_combined_cost_ratio_vs_previous", minimum=0)
+    if value.get("human_approval_required") is not True:
+        raise PromotionError("promotion policy must require human approval")
+    return value
+
+
+def validate_comparison(path: Path) -> dict[str, Any]:
+    report = load_json(path)
+    if report.get("schema") != "workloop-eval-comparison/1" or report.get(
+        "digest"
+    ) != canonical_json_digest(report, omit={"digest"}):
+        raise PromotionError(f"{path}: invalid comparison digest or schema")
+    conditions = report.get("conditions")
+    if not isinstance(conditions, dict) or not {
+        "bare",
+        "previous",
+        "candidate",
+    }.issubset(conditions):
+        raise PromotionError(f"{path}: previous comparison condition is required")
+    dataset = report.get("compatible_envelope", {}).get("dataset")
+    if not isinstance(dataset, dict):
+        raise PromotionError(f"{path}: comparison has no dataset evidence binding")
+    evidence_class = dataset.get("evidence_class")
+    if (
+        evidence_class not in EVIDENCE_CLASSES
+        or dataset.get("held_out") is not (evidence_class == "held-out")
+        or dataset.get("origin") not in {"repository", "external"}
+        or (evidence_class == "held-out" and dataset.get("origin") != "external")
+    ):
+        raise PromotionError(f"{path}: comparison evidence class is invalid")
+    candidate_digest = conditions["candidate"].get("skill_digest")
+    previous_digest = conditions["previous"].get("skill_digest")
+    if not isinstance(candidate_digest, str) or not isinstance(previous_digest, str):
+        raise PromotionError(
+            f"{path}: comparison does not bind candidate/previous Skills"
+        )
+    delta = report.get("deltas", {}).get("candidate_vs_previous")
+    if not isinstance(delta, dict) or not isinstance(delta.get("paired_trials"), dict):
+        raise PromotionError(f"{path}: candidate_vs_previous delta is required")
+    for label in ("previous", "candidate"):
+        metrics = conditions[label]
+        if (
+            not isinstance(metrics.get("total"), int)
+            or isinstance(metrics.get("total"), bool)
+            or metrics["total"] < 1
+            or finite_metric(metrics.get("pass_rate")) is None
+            or token_total(metrics) is None
+        ):
+            raise PromotionError(f"{path}: invalid {label} condition metrics")
+    if (
+        finite_metric(delta.get("pass_rate")) is None
+        or not isinstance(delta["paired_trials"].get("candidate_losses"), int)
+        or isinstance(delta["paired_trials"].get("candidate_losses"), bool)
+        or delta["paired_trials"]["candidate_losses"] < 0
+    ):
+        raise PromotionError(f"{path}: invalid candidate_vs_previous metrics")
+    report["_path"] = str(path.resolve())
+    report["_file_digest"] = file_digest(path)
+    return report
+
+
+def finite_metric(value: Any) -> float | None:
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    ):
+        return float(value)
+    return None
+
+
+def token_total(metrics: dict[str, Any]) -> int | None:
+    combined = metrics.get("usage", {}).get("combined", {})
+    input_tokens = combined.get("input_tokens")
+    output_tokens = combined.get("output_tokens")
+    if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+        return None
+    return input_tokens + output_tokens
+
+
+def ratio(candidate: float, previous: float) -> float | str:
+    if previous == 0:
+        return 1.0 if candidate == 0 else "unbounded"
+    return round(candidate / previous, 6)
+
+
+def main() -> int:
+    args = parse_args()
+    output = args.output.expanduser().resolve()
+    try:
+        if output.exists():
+            raise PromotionError(f"output already exists: {output}")
+        policy_path = args.policy.expanduser().resolve()
+        policy = validate_policy(load_json(policy_path))
+        comparisons = [
+            validate_comparison(path.expanduser().resolve()) for path in args.comparison
+        ]
+        candidate_digests = {
+            item["conditions"]["candidate"]["skill_digest"] for item in comparisons
+        }
+        if len(candidate_digests) != 1:
+            raise PromotionError("comparisons do not evaluate the same candidate Skill")
+    except PromotionError as exc:
+        print(f"decide-promotion: {exc}", file=sys.stderr)
+        return 2
+
+    observed_classes = sorted(
+        {
+            item["compatible_envelope"]["dataset"]["evidence_class"]
+            for item in comparisons
+        }
+    )
+    missing_classes = sorted(
+        set(policy["required_evidence_classes"]) - set(observed_classes)
+    )
+    checks: list[dict[str, Any]] = []
+    if missing_classes:
+        checks.append(
+            {
+                "gate": "required_evidence_classes",
+                "status": "inconclusive",
+                "actual": observed_classes,
+                "required": policy["required_evidence_classes"],
+            }
+        )
+    else:
+        checks.append(
+            {
+                "gate": "required_evidence_classes",
+                "status": "passed",
+                "actual": observed_classes,
+                "required": policy["required_evidence_classes"],
+            }
+        )
+
+    for comparison in comparisons:
+        evidence_class = comparison["compatible_envelope"]["dataset"]["evidence_class"]
+        comparison_digest = comparison["digest"]
+        candidate = comparison["conditions"]["candidate"]
+        previous = comparison["conditions"]["previous"]
+        delta = comparison["deltas"]["candidate_vs_previous"]
+        metrics = [
+            (
+                "min_total_trials_per_condition",
+                min(candidate.get("total", -1), previous.get("total", -1)),
+                policy["min_total_trials_per_condition"],
+                ">=",
+            ),
+            (
+                "min_candidate_pass_rate",
+                candidate.get("pass_rate"),
+                policy["min_candidate_pass_rate"],
+                ">=",
+            ),
+            (
+                "min_candidate_pass_rate_delta_vs_previous",
+                delta.get("pass_rate"),
+                policy["min_candidate_pass_rate_delta_vs_previous"],
+                ">=",
+            ),
+            (
+                "max_candidate_losses_vs_previous",
+                delta["paired_trials"].get("candidate_losses"),
+                policy["max_candidate_losses_vs_previous"],
+                "<=",
+            ),
+        ]
+        for gate, actual, threshold, operator in metrics:
+            actual_number = finite_metric(actual)
+            status = "inconclusive"
+            if actual_number is not None:
+                passed = (
+                    actual_number >= float(threshold)
+                    if operator == ">="
+                    else actual_number <= float(threshold)
+                )
+                status = "passed" if passed else "failed"
+            checks.append(
+                {
+                    "gate": gate,
+                    "status": status,
+                    "actual": actual,
+                    "threshold": threshold,
+                    "operator": operator,
+                    "evidence_class": evidence_class,
+                    "comparison_digest": comparison_digest,
+                }
+            )
+
+        candidate_tokens = token_total(candidate)
+        previous_tokens = token_total(previous)
+        token_ratio = (
+            ratio(candidate_tokens, previous_tokens)
+            if candidate_tokens is not None and previous_tokens is not None
+            else None
+        )
+        max_token_ratio = policy["max_combined_token_ratio_vs_previous"]
+        checks.append(
+            {
+                "gate": "max_combined_token_ratio_vs_previous",
+                "status": (
+                    "inconclusive"
+                    if token_ratio is None
+                    else "failed"
+                    if token_ratio == "unbounded" or token_ratio > max_token_ratio
+                    else "passed"
+                ),
+                "actual": token_ratio,
+                "threshold": max_token_ratio,
+                "operator": "<=",
+                "evidence_class": evidence_class,
+                "comparison_digest": comparison_digest,
+            }
+        )
+
+        max_cost_ratio = policy["max_combined_cost_ratio_vs_previous"]
+        if max_cost_ratio is not None:
+            candidate_cost = finite_metric(
+                candidate.get("usage", {}).get("combined", {}).get("cost_usd")
+            )
+            previous_cost = finite_metric(
+                previous.get("usage", {}).get("combined", {}).get("cost_usd")
+            )
+            cost_ratio = (
+                ratio(candidate_cost, previous_cost)
+                if candidate_cost is not None and previous_cost is not None
+                else None
+            )
+            checks.append(
+                {
+                    "gate": "max_combined_cost_ratio_vs_previous",
+                    "status": (
+                        "inconclusive"
+                        if cost_ratio is None
+                        else "failed"
+                        if cost_ratio == "unbounded" or cost_ratio > max_cost_ratio
+                        else "passed"
+                    ),
+                    "actual": cost_ratio,
+                    "threshold": max_cost_ratio,
+                    "operator": "<=",
+                    "evidence_class": evidence_class,
+                    "comparison_digest": comparison_digest,
+                }
+            )
+
+    statuses = {check["status"] for check in checks}
+    if "failed" in statuses:
+        status = "rejected"
+        exit_code = 1
+    elif "inconclusive" in statuses:
+        status = "inconclusive"
+        exit_code = 3
+    else:
+        status = "eligible_for_human_approval"
+        exit_code = 0
+    decision = {
+        "schema": "workloop-promotion-decision/1",
+        "status": status,
+        "promotion_authorized": False,
+        "human_approval_required": True,
+        "candidate_skill_digest": next(iter(candidate_digests)),
+        "observed_evidence_classes": observed_classes,
+        "missing_evidence_classes": missing_classes,
+        "policy": {
+            "path": str(policy_path),
+            "digest": file_digest(policy_path),
+        },
+        "comparisons": [
+            {
+                "path": item["_path"],
+                "file_digest": item["_file_digest"],
+                "digest": item["digest"],
+                "evidence_class": item["compatible_envelope"]["dataset"][
+                    "evidence_class"
+                ],
+            }
+            for item in comparisons
+        ],
+        "checks": checks,
+    }
+    decision["digest"] = canonical_json_digest(decision)
+    write_json(output, decision)
+    print(f"decide-promotion: {status}: {output}")
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

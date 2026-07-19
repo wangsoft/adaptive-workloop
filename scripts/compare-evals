@@ -167,6 +167,12 @@ def validate_source_summary(
         or summary.get("model_profile") != manifest.get("model_profile")
         or summary.get("host_profile") != manifest.get("host_profile")
         or summary.get("trials") != manifest.get("trials")
+        or summary.get("dataset", {}).get("digest")
+        != manifest.get("dataset", {}).get("digest")
+        or summary.get("dataset", {}).get("evidence_class")
+        != manifest.get("dataset", {}).get("evidence_class")
+        or summary.get("dataset", {}).get("origin")
+        != manifest.get("dataset", {}).get("origin")
     ):
         raise ComparisonError(f"{run_dir}: summary does not match the run manifest")
     selected_ids = manifest.get("dataset", {}).get("case_ids")
@@ -419,6 +425,7 @@ def condition_metrics(run: dict[str, Any]) -> dict[str, Any]:
     return {
         "run": run["path"],
         "manifest_digest": run["manifest"]["digest"],
+        "skill_digest": run["manifest"].get("skill", {}).get("digest"),
         "total": total,
         "passed": passed,
         "failed": total - passed,

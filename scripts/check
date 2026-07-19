@@ -24,10 +24,12 @@ SCRIPT_NAMES = (
     "run-evals",
     "grade-evals",
     "compare-evals",
+    "run-matrix",
+    "decide-promotion",
     "check",
 )
 PYTHON_MODULES = ("workloop_core.py",)
-ADAPTER_SCRIPTS = ("codex-cli", "claude-code")
+ADAPTER_SCRIPTS = ("codex-cli", "claude-code", "codex-grader", "claude-grader")
 ADAPTER_MODULES = ("provider_common.py",)
 LEGACY_PATTERNS = {
     "legacy executable Markdown contract": re.compile(

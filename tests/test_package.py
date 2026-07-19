@@ -15,8 +15,12 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN_EVALS = ROOT / "scripts" / "run-evals"
 GRADE_EVALS = ROOT / "scripts" / "grade-evals"
 COMPARE_EVALS = ROOT / "scripts" / "compare-evals"
+RUN_MATRIX = ROOT / "scripts" / "run-matrix"
+DECIDE_PROMOTION = ROOT / "scripts" / "decide-promotion"
 CODEX_ADAPTER = ROOT / "evals" / "adapters" / "codex-cli"
 CLAUDE_ADAPTER = ROOT / "evals" / "adapters" / "claude-code"
+CODEX_GRADER = ROOT / "evals" / "adapters" / "codex-grader"
+CLAUDE_GRADER = ROOT / "evals" / "adapters" / "claude-grader"
 CHECK = ROOT / "scripts" / "check"
 sys.path.insert(0, str(ROOT / "scripts"))
 from workloop_core import (  # noqa: E402
@@ -125,6 +129,137 @@ class EvalRunnerTests(unittest.TestCase):
         self.assertIn("regression", result.stdout)
         self.assertIn("standalone", result.stdout)
         self.assertIn("profile codex-standalone", result.stdout)
+
+    def test_external_held_out_dataset_is_explicitly_bound_without_label_leakage(
+        self,
+    ) -> None:
+        adapter = ROOT / "tests" / "fixtures" / "fake_eval_adapter.py"
+        dataset_value = {
+            "suite": "adaptive-workloop/behavior",
+            "version": "private-1",
+            "evidence_class": "held-out",
+            "held_out": True,
+            "cases": [
+                {
+                    "id": "ho-001",
+                    "setup": {"task": "Implement a private acceptance case"},
+                    "expected": {
+                        "route": "verified",
+                        "must": ["produce private evidence"],
+                        "must_not": ["leak hidden labels"],
+                    },
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dataset = tmp_path / "held-out.json"
+            dataset.write_text(json.dumps(dataset_value), encoding="utf-8")
+            output = tmp_path / "run"
+            result = subprocess.run(
+                [
+                    str(RUN_EVALS),
+                    "--suite",
+                    "behavior",
+                    "--dataset",
+                    str(dataset),
+                    "--evidence-class",
+                    "held-out",
+                    "--case",
+                    "ho-001",
+                    "--adapter",
+                    str(adapter),
+                    "--allow-review-required",
+                    "--output",
+                    str(output),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            manifest = json.loads((output / "run-manifest.json").read_text())
+            request = json.loads(
+                (output / "cases" / "case-001" / "request.json").read_text()
+            )
+            self.assertEqual(manifest["dataset"]["case_ids"], ["ho-001"])
+            self.assertEqual(manifest["dataset"]["evidence_class"], "held-out")
+            self.assertEqual(manifest["dataset"]["origin"], "external")
+            self.assertTrue(manifest["dataset"]["held_out"])
+            self.assertNotIn("expected", request)
+            self.assertNotIn("must", json.dumps(request))
+            self.assertNotIn("must_not", json.dumps(request))
+
+    def test_dataset_evidence_class_mismatches_fail_closed(self) -> None:
+        dataset_value = {
+            "suite": "adaptive-workloop/behavior",
+            "version": "private-1",
+            "evidence_class": "held-out",
+            "held_out": True,
+            "cases": [
+                {
+                    "id": "ho-001",
+                    "setup": {"task": "Implement a private acceptance case"},
+                    "expected": {"route": "verified", "must": [], "must_not": []},
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = Path(tmp) / "held-out.json"
+            dataset.write_text(json.dumps(dataset_value), encoding="utf-8")
+            mismatch = subprocess.run(
+                [
+                    str(RUN_EVALS),
+                    "--suite",
+                    "behavior",
+                    "--dataset",
+                    str(dataset),
+                    "--evidence-class",
+                    "held-in",
+                    "--dry-run",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            public_as_hidden = subprocess.run(
+                [
+                    str(RUN_EVALS),
+                    "--suite",
+                    "behavior",
+                    "--evidence-class",
+                    "held-out",
+                    "--dry-run",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            ambiguous_validation = subprocess.run(
+                [
+                    str(RUN_EVALS),
+                    "--validate",
+                    "--dataset",
+                    str(dataset),
+                    "--evidence-class",
+                    "held-out",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(mismatch.returncode, 2)
+            self.assertIn("evidence_class", mismatch.stderr)
+            self.assertEqual(public_as_hidden.returncode, 2)
+            self.assertIn("repository datasets are public", public_as_hidden.stderr)
+            self.assertEqual(ambiguous_validation.returncode, 2)
+            self.assertIn("require --suite", ambiguous_validation.stderr)
 
     def test_trigger_adapter_receives_no_expected_labels_and_writes_run_artifacts(
         self,
@@ -638,6 +773,98 @@ class IndependentGraderTests(unittest.TestCase):
             for field in ("request_digest", "response_digest"):
                 self.assertRegex(review_case[field], r"^sha256:[0-9a-f]{64}$")
 
+    def test_codex_grader_runs_in_an_empty_read_only_host_with_bound_identity(
+        self,
+    ) -> None:
+        parent_env = os.environ.copy()
+        parent_env["WORKLOOP_CODEX_BIN"] = str(
+            ROOT / "tests" / "fixtures" / "fake_codex_grader_cli.py"
+        )
+        parent_env["WORKLOOP_GRADER_MODEL"] = "gpt-grader-fixture"
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            collected = self.collect_behavior_run(run_dir)
+            self.assertEqual(
+                collected.returncode, 0, collected.stdout + collected.stderr
+            )
+            reviewed = subprocess.run(
+                [
+                    str(GRADE_EVALS),
+                    "--run",
+                    str(run_dir),
+                    "--grader",
+                    str(CODEX_GRADER),
+                    "--grader-profile",
+                    "codex-gpt-grader-fixture-high",
+                    "--pass-env",
+                    "WORKLOOP_CODEX_BIN",
+                    "--pass-env",
+                    "WORKLOOP_GRADER_MODEL",
+                ],
+                cwd=ROOT,
+                env=parent_env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(reviewed.returncode, 0, reviewed.stdout + reviewed.stderr)
+            response = json.loads(
+                (run_dir / "reviews" / "case-001" / "response.json").read_text()
+            )
+            self.assertEqual(response["runtime"]["host"], "codex")
+            self.assertEqual(
+                response["runtime"]["configured_model"], "gpt-grader-fixture"
+            )
+            self.assertEqual(
+                response["runtime"]["observed_model"], "gpt-grader-observed"
+            )
+            self.assertEqual(response["usage"]["input_tokens"], 17)
+
+    def test_claude_grader_disables_tools_and_records_observed_identity(self) -> None:
+        parent_env = os.environ.copy()
+        parent_env["WORKLOOP_CLAUDE_BIN"] = str(
+            ROOT / "tests" / "fixtures" / "fake_claude_grader_cli.py"
+        )
+        parent_env["WORKLOOP_GRADER_MODEL"] = "claude-grader-fixture"
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            collected = self.collect_behavior_run(run_dir)
+            self.assertEqual(
+                collected.returncode, 0, collected.stdout + collected.stderr
+            )
+            reviewed = subprocess.run(
+                [
+                    str(GRADE_EVALS),
+                    "--run",
+                    str(run_dir),
+                    "--grader",
+                    str(CLAUDE_GRADER),
+                    "--grader-profile",
+                    "claude-grader-fixture-high",
+                    "--pass-env",
+                    "WORKLOOP_CLAUDE_BIN",
+                    "--pass-env",
+                    "WORKLOOP_GRADER_MODEL",
+                ],
+                cwd=ROOT,
+                env=parent_env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(reviewed.returncode, 0, reviewed.stdout + reviewed.stderr)
+            response = json.loads(
+                (run_dir / "reviews" / "case-001" / "response.json").read_text()
+            )
+            self.assertEqual(response["runtime"]["host"], "claude-code")
+            self.assertEqual(
+                response["runtime"]["observed_model"],
+                "claude-grader-observed",
+            )
+            self.assertEqual(response["usage"]["cost_usd"], 0.002)
+
     def test_grader_must_be_independent_from_the_producing_adapter(self) -> None:
         producer = ROOT / "tests" / "fixtures" / "fake_eval_adapter.py"
         with tempfile.TemporaryDirectory() as tmp:
@@ -658,6 +885,28 @@ class IndependentGraderTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("independent", result.stderr)
             self.assertFalse((run_dir / "review-summary.json").exists())
+
+    def test_grader_cannot_pass_without_one_result_per_bound_criterion(self) -> None:
+        grader = ROOT / "tests" / "fixtures" / "fake_incomplete_grader.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            collected = self.collect_behavior_run(run_dir)
+            self.assertEqual(
+                collected.returncode, 0, collected.stdout + collected.stderr
+            )
+            reviewed = subprocess.run(
+                [str(GRADE_EVALS), "--run", str(run_dir), "--grader", str(grader)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(reviewed.returncode, 1, reviewed.stdout + reviewed.stderr)
+            summary = json.loads((run_dir / "review-summary.json").read_text())
+            self.assertEqual(summary["errors"], 1)
+            error = (run_dir / "reviews" / "case-001" / "error.txt").read_text()
+            self.assertIn("criteria coverage", error)
 
     def test_grader_rejects_tampered_source_artifacts(self) -> None:
         grader = ROOT / "tests" / "fixtures" / "fake_grader.py"
@@ -873,6 +1122,326 @@ class EvalComparisonTests(unittest.TestCase):
             report = json.loads(compared.stdout)
             self.assertEqual(report["conditions"]["candidate"]["passed"], 1)
             self.assertEqual(report["conditions"]["bare"]["failed"], 1)
+
+
+class EvalMatrixTests(unittest.TestCase):
+    def matrix_command(self, output: Path, adapter: Path) -> list[str]:
+        return [
+            str(RUN_MATRIX),
+            "--suite",
+            "behavior",
+            "--case",
+            "bc-001",
+            "--adapter",
+            str(adapter),
+            "--grader",
+            str(ROOT / "tests" / "fixtures" / "fake_grader.py"),
+            "--grader-profile",
+            "fixture-grader",
+            "--previous-skill",
+            str(ROOT),
+            "--model-profile",
+            "fixture-model",
+            "--output",
+            str(output),
+        ]
+
+    def test_matrix_runs_bound_bare_previous_candidate_pipeline(self) -> None:
+        adapter = ROOT / "tests" / "fixtures" / "fake_eval_adapter.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "matrix"
+            result = subprocess.run(
+                self.matrix_command(output, adapter),
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            manifest = json.loads((output / "matrix-manifest.json").read_text())
+            matrix_result = json.loads((output / "matrix-result.json").read_text())
+            comparison_path = output / matrix_result["comparison"]["path"]
+            comparison = json.loads(comparison_path.read_text())
+            self.assertEqual(manifest["schema"], "workloop-eval-matrix/1")
+            self.assertEqual(
+                set(comparison["conditions"]), {"bare", "previous", "candidate"}
+            )
+            self.assertEqual(
+                comparison["compatible_envelope"]["dataset"]["evidence_class"],
+                "public",
+            )
+            self.assertEqual(comparison["conditions"]["bare"]["failed"], 1)
+            self.assertEqual(comparison["conditions"]["candidate"]["passed"], 1)
+            self.assertEqual(
+                comparison["conditions"]["candidate"]["skill_digest"],
+                manifest["bindings"]["skills"]["candidate"]["digest"],
+            )
+            events = [
+                json.loads(line)
+                for line in (output / "events.jsonl").read_text().splitlines()
+            ]
+            completed = {
+                event["stage"] for event in events if event["status"] == "completed"
+            }
+            self.assertEqual(
+                completed,
+                {
+                    "run-bare",
+                    "grade-bare",
+                    "run-previous",
+                    "grade-previous",
+                    "run-candidate",
+                    "grade-candidate",
+                    "compare",
+                },
+            )
+
+    def test_matrix_resume_uses_a_new_attempt_after_interrupted_collection(
+        self,
+    ) -> None:
+        adapter = ROOT / "tests" / "fixtures" / "fake_fail_once_adapter.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            output = tmp_path / "matrix"
+            marker = tmp_path / "failed-once"
+            parent_env = os.environ.copy()
+            parent_env["MATRIX_FAIL_MARKER"] = str(marker)
+            command = self.matrix_command(output, adapter)
+            command.extend(["--pass-env", "MATRIX_FAIL_MARKER"])
+            first = subprocess.run(
+                command,
+                cwd=ROOT,
+                env=parent_env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            resumed = subprocess.run(
+                [*command, "--resume"],
+                cwd=ROOT,
+                env=parent_env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+            self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+            attempts = sorted((output / "runs" / "bare").glob("attempt-*"))
+            self.assertEqual(len(attempts), 2)
+            self.assertTrue((output / "matrix-result.json").is_file())
+
+
+class PromotionPolicyTests(unittest.TestCase):
+    def write_policy(self, path: Path) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": "workloop-promotion-policy/1",
+                    "required_evidence_classes": ["public", "held-out"],
+                    "min_total_trials_per_condition": 1,
+                    "min_candidate_pass_rate": 1.0,
+                    "min_candidate_pass_rate_delta_vs_previous": 0.0,
+                    "max_candidate_losses_vs_previous": 0,
+                    "max_combined_token_ratio_vs_previous": 1.5,
+                    "max_combined_cost_ratio_vs_previous": None,
+                    "human_approval_required": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def run_matrix(
+        self, output: Path, dataset: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            str(RUN_MATRIX),
+            "--suite",
+            "behavior",
+            "--adapter",
+            str(ROOT / "tests" / "fixtures" / "fake_eval_adapter.py"),
+            "--grader",
+            str(ROOT / "tests" / "fixtures" / "fake_grader.py"),
+            "--grader-profile",
+            "fixture-grader",
+            "--previous-skill",
+            str(ROOT),
+            "--model-profile",
+            "fixture-model",
+            "--output",
+            str(output),
+        ]
+        if dataset is None:
+            command.extend(["--case", "bc-001"])
+        else:
+            command.extend(
+                [
+                    "--dataset",
+                    str(dataset),
+                    "--evidence-class",
+                    "held-out",
+                    "--case",
+                    "ho-001",
+                ]
+            )
+        return subprocess.run(
+            command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def comparison_path(self, matrix: Path) -> Path:
+        result = json.loads((matrix / "matrix-result.json").read_text())
+        return matrix / result["comparison"]["path"]
+
+    def test_promotion_is_only_eligible_after_public_and_held_out_gates_pass(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dataset = tmp_path / "held-out.json"
+            dataset.write_text(
+                json.dumps(
+                    {
+                        "suite": "adaptive-workloop/behavior",
+                        "version": "private-1",
+                        "evidence_class": "held-out",
+                        "held_out": True,
+                        "cases": [
+                            {
+                                "id": "ho-001",
+                                "setup": {"task": "Private acceptance task"},
+                                "expected": {
+                                    "route": "verified",
+                                    "must": ["fixture response"],
+                                    "must_not": [],
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            public_matrix = tmp_path / "public"
+            held_out_matrix = tmp_path / "held-out"
+            public_result = self.run_matrix(public_matrix)
+            held_out_result = self.run_matrix(held_out_matrix, dataset)
+            self.assertEqual(
+                public_result.returncode,
+                0,
+                public_result.stdout + public_result.stderr,
+            )
+            self.assertEqual(
+                held_out_result.returncode,
+                0,
+                held_out_result.stdout + held_out_result.stderr,
+            )
+            policy = tmp_path / "policy.json"
+            self.write_policy(policy)
+            decision_path = tmp_path / "decision.json"
+            decided = subprocess.run(
+                [
+                    str(DECIDE_PROMOTION),
+                    "--policy",
+                    str(policy),
+                    "--comparison",
+                    str(self.comparison_path(public_matrix)),
+                    "--comparison",
+                    str(self.comparison_path(held_out_matrix)),
+                    "--output",
+                    str(decision_path),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(decided.returncode, 0, decided.stdout + decided.stderr)
+            decision = json.loads(decision_path.read_text())
+            self.assertEqual(decision["status"], "eligible_for_human_approval")
+            self.assertFalse(decision["promotion_authorized"])
+            self.assertTrue(decision["human_approval_required"])
+            self.assertEqual(
+                set(decision["observed_evidence_classes"]), {"public", "held-out"}
+            )
+
+    def test_missing_required_held_out_evidence_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            public_matrix = tmp_path / "public"
+            matrix_result = self.run_matrix(public_matrix)
+            self.assertEqual(
+                matrix_result.returncode,
+                0,
+                matrix_result.stdout + matrix_result.stderr,
+            )
+            policy = tmp_path / "policy.json"
+            self.write_policy(policy)
+            decision_path = tmp_path / "decision.json"
+            decided = subprocess.run(
+                [
+                    str(DECIDE_PROMOTION),
+                    "--policy",
+                    str(policy),
+                    "--comparison",
+                    str(self.comparison_path(public_matrix)),
+                    "--output",
+                    str(decision_path),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(decided.returncode, 3, decided.stdout + decided.stderr)
+            decision = json.loads(decision_path.read_text())
+            self.assertEqual(decision["status"], "inconclusive")
+            self.assertIn("held-out", decision["missing_evidence_classes"])
+
+    def test_failed_quantitative_gate_rejects_the_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            public_matrix = tmp_path / "public"
+            matrix_result = self.run_matrix(public_matrix)
+            self.assertEqual(
+                matrix_result.returncode,
+                0,
+                matrix_result.stdout + matrix_result.stderr,
+            )
+            policy_path = tmp_path / "policy.json"
+            self.write_policy(policy_path)
+            policy = json.loads(policy_path.read_text())
+            policy["required_evidence_classes"] = ["public"]
+            policy["min_candidate_pass_rate_delta_vs_previous"] = 0.1
+            policy_path.write_text(json.dumps(policy), encoding="utf-8")
+            decision_path = tmp_path / "decision.json"
+            decided = subprocess.run(
+                [
+                    str(DECIDE_PROMOTION),
+                    "--policy",
+                    str(policy_path),
+                    "--comparison",
+                    str(self.comparison_path(public_matrix)),
+                    "--output",
+                    str(decision_path),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(decided.returncode, 1, decided.stdout + decided.stderr)
+            decision = json.loads(decision_path.read_text())
+            self.assertEqual(decision["status"], "rejected")
+            self.assertTrue(
+                any(check["status"] == "failed" for check in decision["checks"])
+            )
 
 
 class ProviderAdapterTests(unittest.TestCase):

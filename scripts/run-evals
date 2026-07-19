@@ -27,6 +27,7 @@ from workloop_core import (  # noqa: E402
 
 
 SUITES = ("trigger", "behavior", "regression", "standalone")
+EVIDENCE_CLASSES = ("public", "held-in", "held-out")
 ROUTES = {None, "direct", "verified", "reviewed", "distributed"}
 HOST_PROFILE_FIELDS = {
     "subagents",
@@ -50,6 +51,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--suite", choices=SUITES)
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        help="external eval dataset; requires an explicit matching --evidence-class",
+    )
+    parser.add_argument("--evidence-class", choices=EVIDENCE_CLASSES)
     parser.add_argument("--case", action="append", default=[])
     parser.add_argument("--adapter", type=Path)
     parser.add_argument(
@@ -112,9 +119,37 @@ def validate_common(
     return cases
 
 
-def validate_suite(path: Path, suite: str) -> dict[str, Any]:
+def validate_suite(
+    path: Path,
+    suite: str,
+    *,
+    expected_evidence_class: str = "public",
+    repository_visible: bool = True,
+) -> dict[str, Any]:
     value = load_json(path)
     cases = validate_common(path, value, suite)
+    declared_evidence_class = value.get("evidence_class")
+    held_out = value.get("held_out")
+    if repository_visible:
+        if expected_evidence_class != "public":
+            raise EvalError("repository datasets are public and cannot be held-out")
+        if declared_evidence_class not in {None, "public"} or held_out is True:
+            raise EvalError(
+                f"{path}: repository datasets are public and cannot claim hidden evidence"
+            )
+    else:
+        if declared_evidence_class != expected_evidence_class:
+            raise EvalError(
+                f"{path}: evidence_class must match --evidence-class "
+                f"{expected_evidence_class!r}"
+            )
+        if not isinstance(held_out, bool):
+            raise EvalError(f"{path}: external dataset needs boolean held_out")
+        if held_out is not (expected_evidence_class == "held-out"):
+            raise EvalError(
+                f"{path}: held_out must agree with evidence_class "
+                f"{expected_evidence_class!r}"
+            )
     if suite == "trigger":
         for case in cases:
             if not isinstance(case.get("prompt"), str) or not isinstance(
@@ -167,10 +202,6 @@ def validate_suite(path: Path, suite: str) -> dict[str, Any]:
                 f"{path}: standalone suite must cover every route exactly or repeatedly"
             )
     else:
-        if value.get("held_out") is True:
-            raise EvalError(
-                f"{path}: public repository cases are regression tests, not held-out evidence"
-            )
         for case in cases:
             if not isinstance(case.get("setup"), dict) or not isinstance(
                 case.get("expected"), dict
@@ -178,6 +209,19 @@ def validate_suite(path: Path, suite: str) -> dict[str, Any]:
                 raise EvalError(
                     f"{path}: case {case['id']} needs setup and expected objects"
                 )
+            expected = case["expected"]
+            if expected.get("route") is not None and not isinstance(
+                expected.get("route"), str
+            ):
+                raise EvalError(f"{path}: case {case['id']} has invalid route")
+            for field in ("must", "must_not"):
+                criteria = expected.get(field)
+                if not isinstance(criteria, list) or not all(
+                    isinstance(item, str) and item for item in criteria
+                ):
+                    raise EvalError(
+                        f"{path}: case {case['id']} needs string-array {field}"
+                    )
     return value
 
 
@@ -188,7 +232,9 @@ def suite_paths(root: Path) -> dict[str, Path]:
 def validate_all(root: Path) -> dict[str, dict[str, Any]]:
     validated = {}
     for suite, path in suite_paths(root).items():
-        validated[suite] = validate_suite(path, suite)
+        validated[suite] = validate_suite(
+            path, suite, expected_evidence_class="public", repository_visible=True
+        )
         print(f"validate {suite}: PASS ({len(validated[suite]['cases'])} cases)")
     profile_ids = set()
     for path in sorted((root / "evals" / "profiles").glob("*.json")):
@@ -200,6 +246,47 @@ def validate_all(root: Path) -> dict[str, dict[str, Any]]:
         if required and required not in profile_ids:
             raise EvalError(f"suite {suite} requires missing host profile {required}")
     return validated
+
+
+def resolve_dataset(
+    root: Path,
+    suite: str,
+    dataset_arg: Path | None,
+    evidence_class_arg: str | None,
+    repository_suites: dict[str, dict[str, Any]],
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    if dataset_arg is None:
+        if evidence_class_arg not in {None, "public"}:
+            raise EvalError("repository datasets are public and cannot be held-out")
+        path = suite_paths(root)[suite]
+        value = repository_suites[suite]
+        evidence_class = "public"
+        origin = "repository"
+    else:
+        if evidence_class_arg is None:
+            raise EvalError("external --dataset requires an explicit --evidence-class")
+        path = dataset_arg.expanduser().resolve()
+        if not path.is_file():
+            raise EvalError(f"dataset not found: {path}")
+        value = validate_suite(
+            path,
+            suite,
+            expected_evidence_class=evidence_class_arg,
+            repository_visible=False,
+        )
+        evidence_class = evidence_class_arg
+        origin = "external"
+    return (
+        path,
+        value,
+        {
+            "suite": suite,
+            "digest": file_digest(path),
+            "evidence_class": evidence_class,
+            "origin": origin,
+            "held_out": evidence_class == "held-out",
+        },
+    )
 
 
 def validate_host_profile(path: Path) -> dict[str, Any]:
@@ -519,12 +606,29 @@ def main() -> int:
         print(f"run-evals: {exc}", file=sys.stderr)
         return 2
     if args.validate and args.suite is None:
+        if args.dataset is not None or args.evidence_class is not None:
+            print(
+                "run-evals: --dataset and --evidence-class require --suite",
+                file=sys.stderr,
+            )
+            return 2
         return 0
     if args.suite is None:
         print(
             "run-evals: --suite is required unless only --validate is used",
             file=sys.stderr,
         )
+        return 2
+    try:
+        dataset_path, dataset_value, dataset_binding = resolve_dataset(
+            root,
+            args.suite,
+            args.dataset,
+            args.evidence_class,
+            suites,
+        )
+    except EvalError as exc:
+        print(f"run-evals: {exc}", file=sys.stderr)
         return 2
     if args.trials < 1:
         print("run-evals: --trials must be positive", file=sys.stderr)
@@ -542,7 +646,7 @@ def main() -> int:
         print(f"run-evals: {exc}", file=sys.stderr)
         return 2
 
-    required_host_profile = suites[args.suite].get("required_host_profile")
+    required_host_profile = dataset_value.get("required_host_profile")
     requested_host_profile = args.host_profile or required_host_profile
     try:
         host_profile = load_host_profile(root, requested_host_profile)
@@ -558,7 +662,7 @@ def main() -> int:
         )
         return 2
 
-    selected = suites[args.suite]["cases"]
+    selected = dataset_value["cases"]
     if args.case:
         wanted = set(args.case)
         selected = [case for case in selected if case["id"] in wanted]
@@ -621,8 +725,7 @@ def main() -> int:
             "digest": adapter_digest,
         },
         "dataset": {
-            "suite": args.suite,
-            "digest": file_digest(suite_paths(root)[args.suite]),
+            **dataset_binding,
             "case_ids": [case["id"] for case in selected],
         },
         "trials": args.trials,
@@ -738,6 +841,11 @@ def main() -> int:
             if host_profile
             else None
         ),
+        "dataset": {
+            "digest": file_digest(dataset_path),
+            "evidence_class": dataset_binding["evidence_class"],
+            "origin": dataset_binding["origin"],
+        },
         "trials": args.trials,
         "total": len(summary_cases),
         "passed": passed,
