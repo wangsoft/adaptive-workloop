@@ -1,0 +1,86 @@
+{
+  "schema": "workloop-editable-surfaces/1",
+  "max_surfaces_per_proposal": 1,
+  "protected_paths": [
+    "evals/adapters",
+    "evals/editable-surfaces.json",
+    "evals/profiles",
+    "evals/promotion-policy.json",
+    "scripts"
+  ],
+  "surfaces": [
+    {
+      "id": "skill.trigger",
+      "paths": ["SKILL.md"],
+      "hooks": ["skill.frontmatter.description"],
+      "mechanism_families": ["routing_rule"],
+      "risk": "medium",
+      "review_required": true,
+      "validators": [["scripts/check"]]
+    },
+    {
+      "id": "skill.route.policy",
+      "paths": ["SKILL.md", "references/routes.md"],
+      "hooks": [
+        "routes.direct.entry",
+        "routes.verified.entry",
+        "routes.reviewed.entry",
+        "routes.distributed.entry"
+      ],
+      "mechanism_families": ["routing_rule", "verification_rule"],
+      "risk": "high",
+      "review_required": true,
+      "validators": [["scripts/check"]]
+    },
+    {
+      "id": "verification.guidance",
+      "paths": ["references/verification.md"],
+      "hooks": ["verification.contract", "verification.closeout"],
+      "mechanism_families": ["verification_rule"],
+      "risk": "high",
+      "review_required": true,
+      "validators": [["scripts/check"]]
+    },
+    {
+      "id": "long-running.guidance",
+      "paths": ["references/long-running.md"],
+      "hooks": ["long_running.checkpoint", "long_running.recovery"],
+      "mechanism_families": ["runtime_control", "recovery_rule"],
+      "risk": "medium",
+      "review_required": true,
+      "validators": [["scripts/check"]]
+    },
+    {
+      "id": "episode.templates",
+      "paths": ["assets"],
+      "hooks": ["episode.contract", "episode.checks", "episode.progress", "episode.handoff"],
+      "mechanism_families": ["contract_template", "verification_rule"],
+      "risk": "medium",
+      "review_required": true,
+      "validators": [["scripts/check"]]
+    },
+    {
+      "id": "public.eval.cases",
+      "paths": [
+        "evals/behavior-cases.json",
+        "evals/regression-cases.json",
+        "evals/standalone-cases.json",
+        "evals/trigger-cases.json"
+      ],
+      "hooks": ["evals.public.cases"],
+      "mechanism_families": ["eval_case"],
+      "risk": "medium",
+      "review_required": true,
+      "validators": [["scripts/run-evals", "--validate"], ["scripts/check"]]
+    },
+    {
+      "id": "model.delta.entry",
+      "paths": ["references/model-deltas.json", "references/model-deltas.md"],
+      "hooks": ["model_delta.entry"],
+      "mechanism_families": ["model_delta"],
+      "risk": "high",
+      "review_required": true,
+      "validators": [["scripts/check"]]
+    }
+  ]
+}

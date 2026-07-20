@@ -19,15 +19,18 @@ sys.dont_write_bytecode = True
 from workloop_core import (  # noqa: E402
     BoundedCommandError,
     adapter_runtime_digest,
+    atomic_write_text,
     canonical_json_digest,
     file_digest,
+    redact_evidence_text,
     run_bounded_command,
+    secure_directory,
     skill_runtime_digest,
 )
 
 
 SUITES = ("trigger", "behavior", "regression", "standalone")
-EVIDENCE_CLASSES = ("public", "held-in", "held-out")
+EVIDENCE_CLASSES = ("public", "held-in", "held-out", "audit-held-out")
 ROUTES = {None, "direct", "verified", "reviewed", "distributed"}
 HOST_PROFILE_FIELDS = {
     "subagents",
@@ -130,10 +133,15 @@ def validate_suite(
     cases = validate_common(path, value, suite)
     declared_evidence_class = value.get("evidence_class")
     held_out = value.get("held_out")
+    audit_holdout = value.get("audit_holdout", False)
     if repository_visible:
         if expected_evidence_class != "public":
             raise EvalError("repository datasets are public and cannot be held-out")
-        if declared_evidence_class not in {None, "public"} or held_out is True:
+        if (
+            declared_evidence_class not in {None, "public"}
+            or held_out is True
+            or audit_holdout is True
+        ):
             raise EvalError(
                 f"{path}: repository datasets are public and cannot claim hidden evidence"
             )
@@ -145,9 +153,16 @@ def validate_suite(
             )
         if not isinstance(held_out, bool):
             raise EvalError(f"{path}: external dataset needs boolean held_out")
-        if held_out is not (expected_evidence_class == "held-out"):
+        hidden = expected_evidence_class in {"held-out", "audit-held-out"}
+        audit = expected_evidence_class == "audit-held-out"
+        if held_out is not hidden:
             raise EvalError(
                 f"{path}: held_out must agree with evidence_class "
+                f"{expected_evidence_class!r}"
+            )
+        if audit_holdout is not audit:
+            raise EvalError(
+                f"{path}: audit_holdout must agree with evidence_class "
                 f"{expected_evidence_class!r}"
             )
     if suite == "trigger":
@@ -284,7 +299,8 @@ def resolve_dataset(
             "digest": file_digest(path),
             "evidence_class": evidence_class,
             "origin": origin,
-            "held_out": evidence_class == "held-out",
+            "held_out": evidence_class in {"held-out", "audit-held-out"},
+            "audit_holdout": evidence_class == "audit-held-out",
         },
     )
 
@@ -592,9 +608,7 @@ def run_adapter(
 
 
 def write_json(path: Path, value: Any) -> None:
-    path.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    atomic_write_text(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
 def main() -> int:
@@ -700,7 +714,7 @@ def main() -> int:
     if output.exists() and any(output.iterdir()):
         print(f"run-evals: output directory is not empty: {output}", file=sys.stderr)
         return 2
-    output.mkdir(parents=True, exist_ok=True)
+    secure_directory(output)
     adapter_digest = (
         adapter_runtime_digest(args.adapter) if args.adapter.is_file() else None
     )
@@ -782,7 +796,10 @@ def main() -> int:
             )
             response_path = case_dir / "response.json"
             write_json(response_path, response)
-            (case_dir / "adapter.stderr.txt").write_text(stderr, encoding="utf-8")
+            atomic_write_text(
+                case_dir / "adapter.stderr.txt",
+                redact_evidence_text(stderr, environment=adapter_env),
+            )
             if args.suite == "trigger":
                 grading = grade_trigger(case, args.condition, response)
                 if grading["status"] == "passed":
@@ -820,7 +837,10 @@ def main() -> int:
             )
         except (EvalError, subprocess.TimeoutExpired) as exc:
             errors += 1
-            (case_dir / "error.txt").write_text(str(exc) + "\n", encoding="utf-8")
+            atomic_write_text(
+                case_dir / "error.txt",
+                redact_evidence_text(str(exc) + "\n", environment=adapter_env),
+            )
             summary_cases.append(
                 {
                     "artifact_id": artifact_id,

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -27,6 +28,12 @@ TRANSITIONS = {
     "cancelled": set(),
 }
 KIND_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+GRADING_PATH = "evidence/grading.json"
+
+
+class VerificationGateError(ValueError):
+    pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +60,174 @@ def load_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def resolve_evidence(episode: Path, value: Any) -> tuple[str, Path]:
+    if not isinstance(value, str) or not value:
+        raise VerificationGateError("evidence paths must be non-empty strings")
+    relative = Path(value)
+    if relative.is_absolute():
+        raise VerificationGateError("evidence paths must be relative to the episode")
+    candidate = episode / relative
+    if candidate.is_symlink() or not candidate.is_file():
+        raise VerificationGateError(f"evidence is not a regular file: {value}")
+    resolved = candidate.resolve()
+    try:
+        normalized = resolved.relative_to(episode).as_posix()
+    except ValueError as exc:
+        raise VerificationGateError(f"evidence escapes the episode: {value}") from exc
+    return normalized, resolved
+
+
+def validate_grading(episode: Path, *, recorded_digest: str | None = None) -> str:
+    checks_path = episode / "checks.json"
+    grading_path = episode / GRADING_PATH
+    try:
+        checks = load_json(checks_path)
+        grading = load_json(grading_path)
+    except ValueError as exc:
+        raise VerificationGateError(str(exc)) from exc
+
+    digest = file_digest(grading_path)
+    if recorded_digest is not None and digest != recorded_digest:
+        raise VerificationGateError("grading changed after verification")
+    if checks.get("schema") != "workloop-checks/1":
+        raise VerificationGateError("checks.json has an invalid schema")
+    if grading.get("schema") != "workloop-grading/1":
+        raise VerificationGateError("grading.json has an invalid schema")
+    if grading.get("checks_digest") != file_digest(checks_path):
+        raise VerificationGateError("grading checks digest does not match checks.json")
+
+    expected_checks = checks.get("checks")
+    expected_manual = checks.get("manual")
+    results = grading.get("results")
+    manual = grading.get("manual")
+    summary = grading.get("summary")
+    if not isinstance(expected_checks, list) or not isinstance(expected_manual, list):
+        raise VerificationGateError("checks.json criteria must be arrays")
+    if not isinstance(results, list) or len(results) != len(expected_checks):
+        raise VerificationGateError(
+            "grading results do not cover every automatic check"
+        )
+    if not isinstance(manual, list) or len(manual) != len(expected_manual):
+        raise VerificationGateError("grading does not cover every manual criterion")
+    if not isinstance(summary, dict):
+        raise VerificationGateError("grading summary is missing")
+
+    for index, (expected, result) in enumerate(
+        zip(expected_checks, results, strict=True)
+    ):
+        if not isinstance(expected, dict) or not isinstance(result, dict):
+            raise VerificationGateError(f"automatic check {index} is malformed")
+        check_id = expected.get("id")
+        if not isinstance(check_id, str) or not ID_RE.fullmatch(check_id):
+            raise VerificationGateError(f"automatic check {index} has an invalid id")
+        bound_fields = {
+            "id": check_id,
+            "description": str(expected.get("description", "")).strip(),
+            "argv": expected.get("argv"),
+            "cwd": expected.get("cwd", "."),
+            "risk": expected.get("risk", "workspace-local"),
+            "expected_exit": expected.get("expected_exit", 0),
+        }
+        if any(result.get(key) != value for key, value in bound_fields.items()):
+            raise VerificationGateError(
+                f"grading result is not bound to check {check_id}"
+            )
+        if (
+            result.get("passed") is not True
+            or result.get("terminal") != "pass"
+            or result.get("returncode") != bound_fields["expected_exit"]
+            or result.get("missing_output_patterns") != []
+            or result.get("error") is not None
+        ):
+            raise VerificationGateError(f"automatic check did not pass: {check_id}")
+        try:
+            check_evidence = load_json(episode / "evidence" / f"check-{check_id}.json")
+        except ValueError as exc:
+            raise VerificationGateError(str(exc)) from exc
+        if check_evidence != result:
+            raise VerificationGateError(
+                f"check evidence does not match grading: {check_id}"
+            )
+
+    for index, (expected, attested) in enumerate(
+        zip(expected_manual, manual, strict=True)
+    ):
+        if not isinstance(expected, dict) or not isinstance(attested, dict):
+            raise VerificationGateError(f"manual criterion {index} is malformed")
+        criterion_id = expected.get("id")
+        expected_value = {
+            **expected,
+            "description": str(expected.get("description", "")).strip(),
+            "status": expected.get("status", "open"),
+        }
+        if attested != expected_value or attested.get("status") != "attested":
+            raise VerificationGateError(
+                f"manual criterion is not attested: {criterion_id or index}"
+            )
+
+    expected_summary = {
+        "auto_pass": len(expected_checks),
+        "auto_fail": 0,
+        "manual_attested": len(expected_manual),
+        "manual_open": 0,
+        "passed": True,
+    }
+    if any(summary.get(key) != value for key, value in expected_summary.items()):
+        raise VerificationGateError("grading summary is not a strict pass")
+    return digest
+
+
+def validate_verified_transition(
+    episode: Path, *, kind: str, evidence: list[str]
+) -> dict[str, str]:
+    if kind != "verification.passed":
+        raise VerificationGateError(
+            "verified requires --kind verification.passed and bound grading evidence"
+        )
+    evidence_digests: dict[str, str] = {}
+    for value in evidence:
+        normalized, path = resolve_evidence(episode, value)
+        evidence_digests[normalized] = file_digest(path)
+    if GRADING_PATH not in evidence_digests:
+        raise VerificationGateError(f"verified requires --evidence {GRADING_PATH}")
+    grading_digest = validate_grading(episode)
+    if evidence_digests[GRADING_PATH] != grading_digest:
+        raise VerificationGateError("grading evidence digest is inconsistent")
+    return dict(sorted(evidence_digests.items()))
+
+
+def validate_complete_transition(
+    episode: Path, *, kind: str, previous_event: dict[str, Any]
+) -> None:
+    if kind != "episode.closed":
+        raise VerificationGateError("complete requires --kind episode.closed")
+    if (
+        previous_event.get("status") != "verified"
+        or previous_event.get("kind") != "verification.passed"
+    ):
+        raise VerificationGateError("complete requires a verification.passed event")
+    recorded = previous_event.get("evidence_digests")
+    if not isinstance(recorded, dict) or GRADING_PATH not in recorded:
+        raise VerificationGateError("verified event has no bound grading digest")
+    for value, digest in recorded.items():
+        normalized, path = resolve_evidence(episode, value)
+        if (
+            normalized != value
+            or not isinstance(digest, str)
+            or file_digest(path) != digest
+        ):
+            raise VerificationGateError(f"evidence changed after verification: {value}")
+    validate_grading(episode, recorded_digest=recorded[GRADING_PATH])
+
+
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     temporary = path.with_name(path.name + f".tmp-{os.getpid()}")
     with temporary.open("w", encoding="utf-8") as handle:
@@ -67,7 +242,9 @@ def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
         os.close(directory)
 
 
-def load_events(path: Path, episode_id: str | None) -> list[dict[str, Any]]:
+def load_events(
+    path: Path, episode_id: str | None, manifest_digest: str
+) -> list[dict[str, Any]]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
@@ -94,15 +271,23 @@ def load_events(path: Path, episode_id: str | None) -> list[dict[str, Any]]:
             raise ValueError(f"events.jsonl line {index} belongs to another episode")
         if index > 1 and event.get("from_status") != previous_status:
             raise ValueError(f"events.jsonl line {index} breaks the status chain")
+        if index == 1:
+            recorded_manifest = event.get("manifest_digest")
+            if recorded_manifest is not None and recorded_manifest != manifest_digest:
+                raise ValueError("manifest digest does not match episode.created")
         previous_status = event["status"]
         events.append(event)
     return events
 
 
 def reconcile_state(
-    state_path: Path, events_path: Path, state: dict[str, Any], episode_id: str | None
+    state_path: Path,
+    events_path: Path,
+    state: dict[str, Any],
+    episode_id: str | None,
+    manifest_digest: str,
 ) -> dict[str, Any]:
-    events = load_events(events_path, episode_id)
+    events = load_events(events_path, episode_id, manifest_digest)
     durable = events[-1]
     durable_seq = durable["seq"]
     if (
@@ -146,6 +331,7 @@ def main() -> int:
     except ValueError as exc:
         print(f"episode-state: {exc}", file=sys.stderr)
         return 2
+    manifest_digest = file_digest(manifest_path)
 
     with lock_path.open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -156,6 +342,7 @@ def main() -> int:
                 events_path,
                 state,
                 manifest.get("episode_id"),
+                manifest_digest,
             )
         except ValueError as exc:
             print(f"episode-state: {exc}", file=sys.stderr)
@@ -171,6 +358,20 @@ def main() -> int:
                 f"episode-state: invalid transition {current} -> {args.status}",
                 file=sys.stderr,
             )
+            return 1
+        events = load_events(events_path, manifest.get("episode_id"), manifest_digest)
+        evidence_digests: dict[str, str] = {}
+        try:
+            if args.status == "verified":
+                evidence_digests = validate_verified_transition(
+                    episode, kind=args.kind, evidence=args.evidence
+                )
+            elif args.status == "complete":
+                validate_complete_transition(
+                    episode, kind=args.kind, previous_event=events[-1]
+                )
+        except VerificationGateError as exc:
+            print(f"episode-state: verification gate: {exc}", file=sys.stderr)
             return 1
         if args.status == "complete" and manifest.get("storage") == "tracked":
             findings = scan_tracked_episode(episode)
@@ -195,6 +396,8 @@ def main() -> int:
             "message": args.message or None,
             "evidence": args.evidence,
         }
+        if evidence_digests:
+            event["evidence_digests"] = evidence_digests
         with events_path.open("a", encoding="utf-8") as events:
             events.write(json.dumps(event, sort_keys=True) + "\n")
             events.flush()

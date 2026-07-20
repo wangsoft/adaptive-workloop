@@ -14,7 +14,7 @@ Use for Route 4 and any task that may outlive the current context. Assume the pr
 | `progress.md` | verified truth, next action, assumptions, non-rerunnable effects | update every boundary |
 | `evidence/` | check outputs and grading | generated; bounded retention |
 
-`create-episode` stores Verified/Reviewed work under ignored `.workloop/local/`. Distributed defaults to `.workloop/tracked/`; runtime/capability snapshots, lock files, and evidence remain ignored, while manifest/state/events/contract/checks/progress/handoff can survive Git-based handoff. `episode-state` validates the complete event sequence and status chain, repairs a stale state cache from its last durable event, and blocks `complete` until `check-episode` passes the redaction gate. If the workspace itself is ephemeral, configure an external issue/task store before claiming durability.
+`create-episode` stores Verified/Reviewed work under ignored `.workloop/local/`. Distributed defaults to `.workloop/tracked/`; runtime/capability snapshots, lock files, and evidence remain ignored, while manifest/state/events/contract/checks/progress/handoff can survive Git-based handoff. New episodes bind the manifest digest to `episode.created`. `episode-state` validates the complete event sequence and status chain, repairs a stale state cache from its last durable event, and blocks `verified` without strict grading evidence or `complete` after evidence drift. Tracked completion additionally requires the placeholder/redaction gate. If the workspace itself is ephemeral, configure an external issue/task store before claiming durability.
 
 ## Checkpoint and resume
 

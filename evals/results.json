@@ -62,6 +62,39 @@
         "ruff": "0.15.12 passed"
       },
       "limits": "No real Codex, GPT-5.6-sol, Claude Code, Claude Fable 5, private held-out corpus, authentication/network path, or paid provider call was run. Fake CLIs prove control flow and isolation only, not producer or grader quality. No stable promotion is claimed; a fresh external Agent Skills validator and real proposer-blind matrix remain required before release publication."
+    },
+    {
+      "date": "2026-07-19",
+      "id": "deterministic-candidate-0.5.0",
+      "kind": "deterministic-bounded-self-improvement",
+      "results": {
+        "unit_tests": "66/66 passed",
+        "proposal_contract": "typed one-surface proposal, exact runtime-diff binding, validator/registry/proposal digests, protected controls, frozen search counters, and decline path regressions passed",
+        "sealed_evaluation": "mode-0600 regular-file and no-symlink requirements, checkout/output separation, audit label consistency, broker-owned arguments, validator reproduction, and proposal binding regressions passed",
+        "evidence_classes": "public, held-in, held-out, and audit-held-out dataset and matrix bindings passed",
+        "paired_statistics": "candidate net wins, discordant trials, candidate win rate, and Wilson 95% interval regressions passed",
+        "promotion_policy": "four-class evidence, held-in uplift, paired confidence, candidate/search/one-shot caps, absolute submitted-matrix trial/cost/time budgets, numeric token/cost ratios, proposal consistency, and human-only eligibility regressions passed",
+        "suite_validation": "18 trigger, 11 behavior, 10 public regression, and 4 standalone cases validated",
+        "editable_surface_registry": "7 bounded surfaces validated; stable public case/control files participate in Skill digests while scripts, adapters, profiles, registry, and promotion policy remain protected",
+        "ruff": "0.15.12 passed"
+      },
+      "limits": "No real Codex, GPT-5.6-sol, Claude Code, Claude Fable 5, private held-out or audit-held-out corpus, authentication/network path, paid provider call, or external broker deployment was run. The local sealed broker is a path and permission boundary, not a remote confidentiality guarantee. Fake CLIs prove controls only, not model or grader quality. No stable promotion is claimed; a fresh external Agent Skills validator and real four-class matrix remain required before release publication."
+    },
+    {
+      "date": "2026-07-19",
+      "id": "deterministic-candidate-0.6.0",
+      "kind": "deterministic-governed-search-evidence",
+      "results": {
+        "unit_tests": "74 discovered; 73 passed and 1 intentional recursive-check guard skipped",
+        "search_ledger": "owner-only non-blocking append lock, event hash chain, missing/symlinked control-file rejection, artifact drift validation, candidate closure, selected-candidate binding, rejected-candidate accounting, and whole-search private exposure/resource aggregation regressions passed",
+        "matrix_evidence_safety": "exclusive output lock, owner-only output directories/artifacts, atomic proposal/comparison/decision/JSON/text replacement, fsync, preserved existing parent permissions, and explicit-secret/common-pattern log redaction regressions passed",
+        "observed_identity_policy": "missing provider-observed producer/grader identities are inconclusive; stable distinct identities pass; producer/grader observed-model overlap fails",
+        "promotion_policy": "closed-ledger binding, proposal counter reconciliation, whole-search candidate/round/private-exposure/trial/cost/duration budgets, four-class evidence, uplift/confidence/regression, and human-only eligibility regressions passed",
+        "suite_validation": "18 trigger, 11 behavior, 10 public regression, and 4 standalone cases validated",
+        "editable_surface_registry": "7 bounded surfaces validated",
+        "ruff": "0.15.12 passed"
+      },
+      "limits": "No real Codex, GPT-5.6-sol, Claude Code, Claude Fable 5, private held-out or audit-held-out corpus, authentication/network path, paid provider call, remote transparency log, or external broker deployment was run. Fake CLIs prove deterministic controls only, not model quality, grader calibration, cognitive independence, complete secret DLP, or malicious-owner ledger resistance. No stable promotion is claimed; a fresh external Agent Skills validator and real four-class matrix remain required before release publication."
     }
   ],
   "real_model_matrix": {

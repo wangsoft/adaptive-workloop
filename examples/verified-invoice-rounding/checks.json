@@ -1,0 +1,29 @@
+{
+  "schema": "workloop-checks/1",
+  "checks": [
+    {
+      "id": "invoice-rounding-tests",
+      "description": "focused invoice rounding tests exercise boundary, tax, and decimal behavior",
+      "argv": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        ".",
+        "-p",
+        "test_invoice_rounding.py",
+        "-v"
+      ],
+      "cwd": "examples/fixtures/invoice-rounding",
+      "timeout_seconds": 30,
+      "expected_exit": 0,
+      "output_must_match": [
+        "Ran 3 tests",
+        "OK"
+      ],
+      "risk": "workspace-local"
+    }
+  ],
+  "manual": []
+}

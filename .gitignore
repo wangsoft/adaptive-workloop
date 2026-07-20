@@ -15,3 +15,5 @@ evals/runs/
 .workloop/tracked/*/capabilities.json
 .workloop/tracked/*/evidence/
 .workloop/tracked/*/.state.lock
+dist/
+/.nezha/

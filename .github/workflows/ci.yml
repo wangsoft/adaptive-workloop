@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   deterministic-checks:
     name: ${{ matrix.os }} / Python ${{ matrix.python }}
@@ -26,8 +31,8 @@ jobs:
           - os: macos-latest
             python: "3.12"
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python }}
       - name: Install pinned static checker
@@ -36,3 +41,29 @@ jobs:
         run: make lint
       - name: Deterministic package gate
         run: make check
+
+  spec-validation:
+    name: Agent Skills spec
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+      - name: Validate SKILL.md against the Agent Skills specification
+        run: make check-spec
+
+  # Isolated because `claude-code plugin validate` cold-installs a large npm
+  # package; its download time must not flake the fast spec check above.
+  plugin-validation:
+    name: Claude Code plugin
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+      - name: Validate Claude Code plugin and marketplace manifests
+        run: make check-claude-plugin

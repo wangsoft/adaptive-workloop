@@ -15,12 +15,13 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 sys.dont_write_bytecode = True
-from workloop_core import repository_snapshot  # noqa: E402
+from workloop_core import repository_snapshot, skill_runtime_digest  # noqa: E402
 
 
 ROUTES = ("verified", "reviewed", "distributed")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 MANAGED_IGNORE = """# adaptive-workloop managed runtime state
+.gitignore
 local/
 tracked/*/runtime.json
 tracked/*/capabilities.json
@@ -62,21 +63,6 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def package_digest(skill_dir: Path) -> str:
-    digest = hashlib.sha256()
-    included = [skill_dir / "SKILL.md"]
-    for directory in ("scripts", "references", "assets"):
-        included.extend(sorted((skill_dir / directory).glob("*")))
-    for path in included:
-        if not path.is_file() or "__pycache__" in path.parts:
-            continue
-        digest.update(path.relative_to(skill_dir).as_posix().encode())
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
 def skill_version(skill_md: Path) -> str:
     text = skill_md.read_text(encoding="utf-8")
     match = re.search(r'^\s*version:\s*["\']?([^"\'\n]+)', text, re.MULTILINE)
@@ -103,8 +89,18 @@ def ensure_ignore_file(path: Path) -> None:
         path.write_text(MANAGED_IGNORE, encoding="utf-8")
         return
     current = path.read_text(encoding="utf-8")
-    if "# adaptive-workloop managed runtime state" not in current:
-        path.write_text(current.rstrip() + "\n\n" + MANAGED_IGNORE, encoding="utf-8")
+    current_lines = set(current.splitlines())
+    missing = [
+        line for line in MANAGED_IGNORE.splitlines() if line not in current_lines
+    ]
+    if missing:
+        separator = (
+            "\n" if "# adaptive-workloop managed runtime state" in current else "\n\n"
+        )
+        path.write_text(
+            current.rstrip() + separator + "\n".join(missing) + "\n",
+            encoding="utf-8",
+        )
 
 
 def load_capabilities(path: Path | None) -> dict[str, Any] | None:
@@ -235,7 +231,7 @@ def main() -> int:
         "skill": {
             "name": "adaptive-workloop",
             "version": skill_version(skill_dir / "SKILL.md"),
-            "digest": "sha256:" + package_digest(skill_dir),
+            "digest": skill_runtime_digest(skill_dir),
         },
         "repo": {
             "root": ".",
@@ -269,6 +265,7 @@ def main() -> int:
         "status": "open",
         "message": None,
         "evidence": [],
+        "manifest_digest": "sha256:" + file_sha256(episode / "manifest.json"),
     }
     (episode / "events.jsonl").write_text(
         json.dumps(event, sort_keys=True) + "\n", encoding="utf-8"

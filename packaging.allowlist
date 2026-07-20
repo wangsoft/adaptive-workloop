@@ -1,0 +1,39 @@
+# packaging.allowlist — files included in a published/installed artifact.
+#
+# `make package` ships exactly these paths. Everything else in the repo
+# (tests/, .github/, dev-only contracts, caches) is maintainer material and
+# stays out of the user's install.
+#
+# NOTE: the promotion/eval scripts under scripts/ and evals/ DO ship. They are
+# part of the Skill's runtime digest surface (workloop_core.SKILL_RUNTIME_SURFACES)
+# and the tamper-evidence + governance design depends on their presence. This
+# allowlist trims non-runtime material only; it never strips a digested surface.
+#
+# One path or directory per line. A trailing "/" ships the whole subtree.
+
+SKILL.md
+README.md
+README.zh-CN.md
+LICENSE
+packaging.allowlist
+
+.claude-plugin/
+agents/
+scripts/
+references/
+assets/
+
+# Runtime eval surfaces (cases, profiles, adapters, policy, registry).
+evals/adapters/
+evals/profiles/
+evals/adapter-contract.md
+evals/grader-contract.md
+evals/matrix-protocol.md
+evals/proposal-contract.md
+evals/provider-adapters.md
+evals/trigger-cases.json
+evals/behavior-cases.json
+evals/regression-cases.json
+evals/standalone-cases.json
+evals/editable-surfaces.json
+evals/promotion-policy.json

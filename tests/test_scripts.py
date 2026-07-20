@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import json
 import re
+import sys
 from pathlib import Path
 
 
@@ -14,6 +15,91 @@ VERIFY_CONTRACT = ROOT / "scripts" / "verify-contract"
 EPISODE_STATE = ROOT / "scripts" / "episode-state"
 PROBE_CAPABILITIES = ROOT / "scripts" / "probe-capabilities"
 CHECK_EPISODE = ROOT / "scripts" / "check-episode"
+sys.path.insert(0, str(ROOT / "scripts"))
+from workloop_core import skill_runtime_digest  # noqa: E402
+
+
+def fill_episode_documents(episode: Path) -> None:
+    (episode / "contract.md").write_text(
+        """# Contract — test episode
+
+## Outcome
+
+Produce a locally verifiable result for the test fixture.
+
+## Scope
+
+- In: the bounded fixture
+- Out / non-goals: external effects
+- Owned paths: the temporary repository
+- Interfaces that must remain compatible: workloop-checks/1
+
+## Risk and trust boundaries
+
+- Risk class: low
+- Signals: none
+- Untrusted inputs: none
+- External or non-rerunnable effects: none
+- Rollback boundary: delete the temporary directory
+- What an independent verifier must attack: whether the command really runs
+
+## Completion map
+
+- Automatic check IDs: truth
+- Manual attestation IDs: none
+
+## Budgets and stop conditions
+
+- Wall-clock / token / retry budget: one local attempt
+- Stop and hand off when: the local command fails
+
+## Decisions
+
+- Keep the fixture deterministic and local.
+""",
+        encoding="utf-8",
+    )
+    (episode / "progress.md").write_text(
+        """# Progress — test episode
+
+## Verified state
+
+- Phase: verification
+- Verified true and evidence: checks.json defines the local command
+- Assumed / unknown: none
+- Broken: none
+- Current state.json status: in_progress
+
+## Completed units
+
+- Contract prepared — checks.json — truth — evidence/grading.json
+
+## Next actions
+
+1. Run verify-contract and bind its grading artifact.
+
+## Decisions and reroutes
+
+- No reroute required.
+
+## Blockers
+
+- None.
+
+## Not re-runnable
+
+- None.
+
+## Resume protocol
+
+Read state.json, events.jsonl, progress.md, contract.md, and checks.json, then rerun verification.
+""",
+        encoding="utf-8",
+    )
+    (episode / "handoff.md").write_text(
+        "# Handoff — test episode\n\nNot applicable to this non-distributed fixture.\n",
+        encoding="utf-8",
+    )
 
 
 class CreateEpisodeTests(unittest.TestCase):
@@ -91,7 +177,7 @@ class CreateEpisodeTests(unittest.TestCase):
             self.assertEqual(manifest["storage"], "local")
             self.assertEqual(manifest["model"]["id"], "test-model")
             self.assertNotIn("status", manifest)
-            self.assertRegex(manifest["skill"]["digest"], r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual(manifest["skill"]["digest"], skill_runtime_digest(ROOT))
             self.assertEqual(state["status"], "open")
             self.assertEqual(checks["schema"], "workloop-checks/1")
             self.assertEqual(checks["checks"], [])
@@ -104,6 +190,9 @@ class CreateEpisodeTests(unittest.TestCase):
             self.assertIsNone(first_event["from_status"])
             self.assertIn(
                 "local/", (Path(tmp) / ".workloop" / ".gitignore").read_text()
+            )
+            self.assertIn(
+                ".gitignore", (Path(tmp) / ".workloop" / ".gitignore").read_text()
             )
 
     def test_migrates_legacy_ignore_all_state_for_distributed_durability(self) -> None:
@@ -133,6 +222,47 @@ class CreateEpisodeTests(unittest.TestCase):
             self.assertNotEqual(ignore.strip(), "*")
             self.assertIn("local/", ignore)
             self.assertTrue(any((workloop / "tracked").iterdir()))
+
+    def test_local_runtime_ignore_keeps_a_git_worktree_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initialized = subprocess.run(
+                ["git", "init", "-q"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                initialized.returncode, 0, initialized.stdout + initialized.stderr
+            )
+
+            created = subprocess.run(
+                [
+                    str(CREATE_EPISODE),
+                    "--task",
+                    "keep local state invisible",
+                    "--route",
+                    "verified",
+                    "--dir",
+                    str(root),
+                    "--storage",
+                    "local",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(created.returncode, 0, created.stdout + created.stderr)
+            status = subprocess.run(
+                ["git", "status", "--porcelain=v1"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertEqual(status.stdout, "")
 
 
 class VerifyContractTests(unittest.TestCase):
@@ -189,6 +319,7 @@ class VerifyContractTests(unittest.TestCase):
             )
             self.assertIn("Episode created:", created.stdout)
             episode = next((root / ".workloop" / "local").iterdir())
+            fill_episode_documents(episode)
             (episode / "checks.json").write_text(
                 json.dumps(
                     {
@@ -266,6 +397,97 @@ class VerifyContractTests(unittest.TestCase):
             self.assertLess(duration, 0.8)
             self.assertIn("TIMEOUT", result.stdout)
 
+    def test_rejects_a_zero_test_hollow_green_even_with_exit_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner = root / "empty-test-runner"
+            runner.write_text(
+                "#!/usr/bin/env python3\nprint('Ran 0 tests in 0.000s')\n",
+                encoding="utf-8",
+            )
+            runner.chmod(0o755)
+            checks = root / "checks.json"
+            checks.write_text(
+                json.dumps(
+                    {
+                        "schema": "workloop-checks/1",
+                        "checks": [
+                            {
+                                "id": "tests",
+                                "description": "targeted tests exercise the change",
+                                "argv": [str(runner)],
+                                "timeout_seconds": 5,
+                                "risk": "workspace-local",
+                            }
+                        ],
+                        "manual": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [str(VERIFY_CONTRACT), str(checks)],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("HOLLOW", result.stdout)
+            grading = json.loads((root / "evidence" / "grading.json").read_text())
+            self.assertFalse(grading["summary"]["passed"])
+
+    def test_rejects_unfilled_episode_documents_before_running_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(
+                [
+                    str(CREATE_EPISODE),
+                    "--task",
+                    "reject placeholder contract",
+                    "--route",
+                    "verified",
+                    "--dir",
+                    tmp,
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            episode = next((root / ".workloop" / "local").iterdir())
+            self.write_placeholder_check(episode)
+
+            result = subprocess.run(
+                [str(VERIFY_CONTRACT), str(episode)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("unfilled placeholder", result.stderr)
+
+    def write_placeholder_check(self, episode: Path) -> None:
+        (episode / "checks.json").write_text(
+            json.dumps(
+                {
+                    "schema": "workloop-checks/1",
+                    "checks": [
+                        {
+                            "id": "truth",
+                            "description": "would pass if the contract were complete",
+                            "argv": ["pwd"],
+                            "risk": "workspace-local",
+                        }
+                    ],
+                    "manual": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def test_timeout_preserves_partial_output_without_crashing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -274,7 +496,7 @@ class VerifyContractTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import time\n"
                 "print('started-before-timeout', flush=True)\n"
-                "time.sleep(2)\n"
+                "time.sleep(5)\n"
             )
             sleeper.chmod(0o755)
             checks = root / "checks.json"
@@ -287,7 +509,7 @@ class VerifyContractTests(unittest.TestCase):
                                 "id": "partial-output",
                                 "description": "partial output is evidence",
                                 "argv": [str(sleeper)],
-                                "timeout_seconds": 0.8,
+                                "timeout_seconds": 2,
                                 "risk": "workspace-local",
                             }
                         ],
@@ -310,6 +532,214 @@ class VerifyContractTests(unittest.TestCase):
 
 
 class EpisodeStateTests(unittest.TestCase):
+    def write_passing_checks(self, episode: Path) -> None:
+        (episode / "checks.json").write_text(
+            json.dumps(
+                {
+                    "schema": "workloop-checks/1",
+                    "checks": [
+                        {
+                            "id": "truth",
+                            "description": "a real local command passes",
+                            "argv": ["pwd"],
+                            "cwd": ".",
+                            "timeout_seconds": 5,
+                            "expected_exit": 0,
+                            "risk": "workspace-local",
+                        }
+                    ],
+                    "manual": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def start_and_verify(self, episode: Path) -> None:
+        fill_episode_documents(episode)
+        self.write_passing_checks(episode)
+        subprocess.run(
+            [
+                str(EPISODE_STATE),
+                str(episode),
+                "--status",
+                "in_progress",
+                "--kind",
+                "work.started",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            [str(VERIFY_CONTRACT), str(episode)],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            [
+                str(EPISODE_STATE),
+                str(episode),
+                "--status",
+                "verified",
+                "--kind",
+                "verification.passed",
+                "--evidence",
+                "evidence/grading.json",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+    def test_verified_requires_a_bound_passing_grading_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(
+                [
+                    str(CREATE_EPISODE),
+                    "--task",
+                    "reject hollow verification",
+                    "--route",
+                    "verified",
+                    "--dir",
+                    tmp,
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            episode = next((root / ".workloop" / "local").iterdir())
+            subprocess.run(
+                [str(EPISODE_STATE), str(episode), "--status", "in_progress"],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            missing = subprocess.run(
+                [str(EPISODE_STATE), str(episode), "--status", "verified"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            (episode / "evidence" / "grading.json").write_text(
+                json.dumps(
+                    {"schema": "workloop-grading/1", "summary": {"passed": True}}
+                ),
+                encoding="utf-8",
+            )
+            forged = subprocess.run(
+                [
+                    str(EPISODE_STATE),
+                    str(episode),
+                    "--status",
+                    "verified",
+                    "--kind",
+                    "verification.passed",
+                    "--evidence",
+                    "evidence/grading.json",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(missing.returncode, 1, missing.stdout + missing.stderr)
+            self.assertIn("verification gate", missing.stderr)
+            self.assertEqual(forged.returncode, 1, forged.stdout + forged.stderr)
+            self.assertIn("checks digest", forged.stderr)
+            state = json.loads((episode / "state.json").read_text())
+            self.assertEqual(state["status"], "in_progress")
+
+    def test_manifest_drift_is_rejected_before_any_state_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(
+                [
+                    str(CREATE_EPISODE),
+                    "--task",
+                    "bind immutable manifest",
+                    "--route",
+                    "verified",
+                    "--dir",
+                    tmp,
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            episode = next((root / ".workloop" / "local").iterdir())
+            state_before = (episode / "state.json").read_bytes()
+            manifest = json.loads((episode / "manifest.json").read_text())
+            manifest["task"] = "tampered after creation"
+            (episode / "manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+
+            result = subprocess.run(
+                [str(EPISODE_STATE), str(episode), "--status", "in_progress"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("manifest digest", result.stderr)
+            self.assertEqual((episode / "state.json").read_bytes(), state_before)
+
+    def test_verified_binds_grading_digest_and_complete_rejects_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(
+                [
+                    str(CREATE_EPISODE),
+                    "--task",
+                    "bind verification evidence",
+                    "--route",
+                    "verified",
+                    "--dir",
+                    tmp,
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            episode = next((root / ".workloop" / "local").iterdir())
+            self.start_and_verify(episode)
+            events = [
+                json.loads(line)
+                for line in (episode / "events.jsonl").read_text().splitlines()
+            ]
+            grading_digest = events[-1]["evidence_digests"]["evidence/grading.json"]
+            self.assertRegex(grading_digest, r"^sha256:[0-9a-f]{64}$")
+
+            grading = json.loads((episode / "evidence" / "grading.json").read_text())
+            grading["summary"]["auto_pass"] = 99
+            (episode / "evidence" / "grading.json").write_text(
+                json.dumps(grading), encoding="utf-8"
+            )
+            completed = subprocess.run(
+                [
+                    str(EPISODE_STATE),
+                    str(episode),
+                    "--status",
+                    "complete",
+                    "--kind",
+                    "episode.closed",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(
+                completed.returncode, 1, completed.stdout + completed.stderr
+            )
+            self.assertIn("changed after verification", completed.stderr)
+            state = json.loads((episode / "state.json").read_text())
+            self.assertEqual(state["status"], "verified")
+
     def test_updates_mutable_state_and_appends_an_event_without_touching_manifest(
         self,
     ) -> None:
@@ -443,13 +873,7 @@ class EpisodeStateTests(unittest.TestCase):
                 check=True,
             )
             episode = next((root / ".workloop" / "tracked").iterdir())
-            for status in ("in_progress", "verified"):
-                subprocess.run(
-                    [str(EPISODE_STATE), str(episode), "--status", status],
-                    text=True,
-                    capture_output=True,
-                    check=True,
-                )
+            self.start_and_verify(episode)
             canary = "sk-" + "A" * 40
             (episode / "handoff.md").write_text(
                 f"# Handoff\n\napi_key: {canary}\n", encoding="utf-8"
@@ -462,7 +886,14 @@ class EpisodeStateTests(unittest.TestCase):
                 check=False,
             )
             blocked = subprocess.run(
-                [str(EPISODE_STATE), str(episode), "--status", "complete"],
+                [
+                    str(EPISODE_STATE),
+                    str(episode),
+                    "--status",
+                    "complete",
+                    "--kind",
+                    "episode.closed",
+                ],
                 text=True,
                 capture_output=True,
                 check=False,
@@ -484,7 +915,14 @@ class EpisodeStateTests(unittest.TestCase):
                 check=False,
             )
             completed = subprocess.run(
-                [str(EPISODE_STATE), str(episode), "--status", "complete"],
+                [
+                    str(EPISODE_STATE),
+                    str(episode),
+                    "--status",
+                    "complete",
+                    "--kind",
+                    "episode.closed",
+                ],
                 text=True,
                 capture_output=True,
                 check=False,

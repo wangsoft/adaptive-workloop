@@ -13,6 +13,9 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+from workloop_core import validate_release_manifest  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_NAMES = (
@@ -25,10 +28,14 @@ SCRIPT_NAMES = (
     "grade-evals",
     "compare-evals",
     "run-matrix",
+    "run-sealed-matrix",
+    "search-ledger",
+    "validate-proposal",
     "decide-promotion",
+    "package-skill",
     "check",
 )
-PYTHON_MODULES = ("workloop_core.py",)
+PYTHON_MODULES = ("workloop_core.py", "workloop_search.py")
 ADAPTER_SCRIPTS = ("codex-cli", "claude-code", "codex-grader", "claude-grader")
 ADAPTER_MODULES = ("provider_common.py",)
 LEGACY_PATTERNS = {
@@ -129,6 +136,57 @@ def validate_json() -> None:
             fail(f"model delta {entry['id']} is active but expired")
 
 
+def validate_claude_plugin() -> None:
+    plugin_path = ROOT / ".claude-plugin" / "plugin.json"
+    marketplace_path = ROOT / ".claude-plugin" / "marketplace.json"
+    try:
+        plugin = json.loads(plugin_path.read_text(encoding="utf-8"))
+        marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"invalid Claude plugin metadata: {exc}")
+    if plugin.get("name") != "adaptive-workloop":
+        fail("Claude plugin name does not match the Skill")
+    frontmatter = (ROOT / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[1]
+    version_match = re.search(r'(?m)^\s+version:\s*"([^"]+)"$', frontmatter)
+    if version_match is None or plugin.get("version") != version_match.group(1):
+        fail("Claude plugin version does not match SKILL.md metadata.version")
+    entries = marketplace.get("plugins")
+    if (
+        not isinstance(entries, list)
+        or len(entries) != 1
+        or not isinstance(entries[0], dict)
+    ):
+        fail("Claude marketplace must contain exactly one plugin entry")
+    entry = entries[0]
+    if entry.get("name") != plugin["name"] or entry.get("source") != "./":
+        fail("Claude marketplace entry does not bind the root plugin")
+    for field in (
+        "skills",
+        "commands",
+        "agents",
+        "hooks",
+        "mcpServers",
+        "outputStyles",
+        "lspServers",
+    ):
+        value = entry.get(field)
+        values = value if isinstance(value, list) else [value]
+        for path in values:
+            if path is not None and isinstance(path, str) and not path.startswith("./"):
+                fail(f"Claude marketplace {field} path must start with ./: {path}")
+
+
+def validate_packaged_release() -> bool:
+    if not (ROOT / "release-manifest.json").is_file():
+        return False
+    try:
+        validate_release_manifest(ROOT)
+    except ValueError as exc:
+        fail(f"release manifest validation failed: {exc}")
+    print("release manifest: PASS")
+    return True
+
+
 def validate_scripts() -> None:
     with tempfile.TemporaryDirectory(prefix="adaptive-workloop-check-") as tmp:
         compile_dir = Path(tmp)
@@ -193,14 +251,40 @@ def validate_no_legacy_contract() -> None:
 def main() -> int:
     if sys.version_info < (3, 10):
         fail("Python 3.10+ is required")
+    packaged_release = validate_packaged_release()
     validate_frontmatter()
     validate_json()
+    validate_claude_plugin()
     validate_scripts()
     validate_no_legacy_contract()
     run(str(ROOT / "scripts" / "run-evals"), "--validate")
-    env = os.environ.copy()
-    env["WORKLOOP_CHECK_INNER"] = "1"
-    run(sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v", env=env)
+    run(
+        str(ROOT / "scripts" / "validate-proposal"),
+        "--registry",
+        str(ROOT / "evals" / "editable-surfaces.json"),
+        "--validate-registry",
+    )
+    if packaged_release:
+        print("source tests: not shipped; release payload integrity verified")
+    else:
+        if not (ROOT / "tests").is_dir():
+            fail("source tests are missing and no release manifest is present")
+        env = os.environ.copy()
+        env["WORKLOOP_CHECK_INNER"] = "1"
+        # Keep the installed Skill package pristine: importing runtime modules from a
+        # subprocess must not litter scripts/__pycache__ (a stray tree also perturbs
+        # any content hash taken over the checkout).
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        run(
+            sys.executable,
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests",
+            "-v",
+            env=env,
+        )
     print("check: PASS")
     return 0
 

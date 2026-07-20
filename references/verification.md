@@ -45,7 +45,7 @@ Freeform shell strings are invalid. Use argv arrays so task text and Markdown ca
 }
 ```
 
-Check IDs use lowercase letters, digits, and hyphens. `cwd` must remain inside the repository. Close-out is strict: empty criteria, schema errors, failed/timeout checks, missing output patterns, or open manual criteria fail.
+Check IDs use lowercase letters, digits, and hyphens. `cwd` must remain inside the repository. Close-out is strict: empty criteria, unfilled episode templates, schema errors, failed/timeout checks, common zero-test success output, missing output patterns, or open manual criteria fail.
 
 ## Execution boundary
 
@@ -57,6 +57,12 @@ Check IDs use lowercase letters, digits, and hyphens. `cwd` must remain inside t
 - Prints successful stdout/stderr and stores `evidence/check-<id>.json` plus `evidence/grading.json`.
 - Requires `--allow-risk network` or `--allow-risk external-side-effect` for a declared non-local risk.
 
+`episode-state` is the promotion boundary. Entering `verified` requires
+`--kind verification.passed --evidence evidence/grading.json`; it validates the
+grading schema, current checks digest, every automatic result, per-check evidence,
+and manual attestations before recording evidence digests. Entering `complete`
+requires `episode.closed` and rejects any later grading or evidence drift.
+
 The verifier is not a sandbox. Package scripts and test runners can still execute repository code. Host permissions, isolation, network policy, and action-bound approval remain authoritative. Never hide push, publish, migration, deletion, payment, deploy, send, or other irreversible effects inside a verification check; invoke them directly through the host after approval.
 
 ## Evidence rules
@@ -64,6 +70,7 @@ The verifier is not a sandbox. Package scripts and test runners can still execut
 - A claim counts only when this session ran the command and retained output or a referenced CI/runtime artifact.
 - Re-read line numbers, dirty state, release state, and other source-of-truth facts in the current turn.
 - Exit 0 alone is insufficient when the command can pass without exercising the changed path. Use `output_must_match`, a targeted test, coverage evidence, or a manual criterion.
+- Common `0 tests`/`0 passing`/`no tests found` output on a test-like check is rejected even with exit 0. This is a heuristic, so retain explicit non-empty output assertions.
 - Pipelines that swallow failures, watch modes, interactive commands, and flaky checks cannot be the sole high-risk gate.
 
 ## Hollow greens

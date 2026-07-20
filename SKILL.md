@@ -1,11 +1,11 @@
 ---
 name: adaptive-workloop
-description: "Risk-based process router for a multi-step engineering task. Use when work needs execution routing across ambiguity, high-risk changes, weak verification, independent review, multiple sessions, or model/host capabilities; when resuming a .workloop episode; or when the user explicitly asks how much process, verification, or coordination a task needs. Not for one-step edits, ordinary isolated bug fixes, standalone reviews, pure Q&A, explanations, or prose-only writing."
+description: "Risk-based process router for a multi-step engineering task. Use when work needs execution routing across ambiguity, high-risk changes (auth, payments, data migration, public API, release), weak verification, independent review, multiple sessions, or model/host capability differences; when resuming a .workloop episode; or when the user explicitly asks how much process a task needs (how should we execute this, do we need independent review, is this change risky, 怎么开工, 该走什么流程, 要不要独立 review, 这个改动风险大吗). Not for one-step edits, ordinary isolated bug fixes, standalone reviews, pure Q&A, explanations, or prose-only writing."
 license: MIT
 metadata:
-  version: "0.4.0"
+  version: "0.6.0"
   compatibility: "Host-agnostic instructions; deterministic scripts require Python 3.10+ on macOS/Linux."
-  status: "candidate — evidence-class binding, isolated independent graders, resumable eval matrices, and fail-closed promotion gates pass deterministically; real-model held-out evidence is still required before stable promotion"
+  status: "candidate — append-only search accounting, private atomic evidence writes, observed-model identity gates, and human-only promotion pass deterministically; real-model private evidence is still required before stable promotion"
 ---
 
 # Adaptive Workloop
@@ -31,7 +31,7 @@ Do not install, fetch, or enable a missing Skill during task execution unless th
 | P2 | Unknown model or host is supported; use the conservative cadence. |
 | P3 | Model deltas patch measured behavior only; they never replace routes or permissions. |
 | P4 | Demonstrated capability may increase step size, never authority. |
-| P5 | The skill may propose improvements but may not self-modify. |
+| P5 | The skill may propose one typed, bounded improvement but may not edit its evaluator, permissions, promotion policy, or other protected control surfaces. |
 | P6 | Delete rules that show no held-in uplift or cause public/private regression. |
 
 ## Workloop
@@ -64,6 +64,8 @@ The script detects repository facts, verification commands, CI, runtimes, and ho
 ```
 
 Unknown fields or missing capabilities degrade the route; they do not grant authority or abort ordinary work.
+
+If Python 3.10+ is unavailable, the scripts cannot run, but the router still applies (P2): classify and route from the tables below, keep the same gates, record contract criteria and their evidence by hand in the episode notes, and treat every verification claim under the same transcript-evidence rule. A missing runtime lowers convenience, never the evidence bar or authority.
 
 To validate the minimum Codex-only installation, use `evals/profiles/codex-standalone.json`. It intentionally declares no optional specialist Skills, browser, subagents, or native orchestration so every fallback remains testable.
 
@@ -128,7 +130,7 @@ After the contract is ready, start execution with `<skill-dir>/scripts/episode-s
 <skill-dir>/scripts/episode-state <episode-dir> --status complete --kind episode.closed
 ```
 
-Close-out is strict: every automatic check passes, every manual criterion is attested, command output is visible, and `evidence/grading.json` exists. The verifier executes argv without a shell, constrains cwd to the repository, enforces timeouts, and refuses external-risk checks unless explicitly allowed. It is not a sandbox; host policy remains the enforcement boundary.
+Close-out is strict: every automatic check passes, every manual criterion is attested, command output is visible, and `evidence/grading.json` exists. The verifier rejects unfilled episode templates and common zero-test greens. The `verified` event binds the current checks, per-check evidence, and grading digest; `complete` revalidates that binding. It executes argv without a shell, constrains cwd to the repository, enforces timeouts, and refuses external-risk checks unless explicitly allowed. It is not a sandbox; host policy remains the enforcement boundary.
 
 Before a tracked Distributed episode can enter `complete`, `episode-state` enforces the redacted Git-visible surface with `scripts/check-episode`. It reports rule and location, never the matched value. `events.jsonl` is the durable write-ahead record; each state transition validates its sequence and status chain, then repairs a stale `state.json` cache before continuing.
 
@@ -138,32 +140,13 @@ For high-risk work without an independent verifier, a labeled self-review may pr
 
 ## Model adaptation
 
-Record the actual model, host, effort, capabilities, tool surface, and Skill digest in each episode. Apply an entry from `references/model-deltas.json` only when its evidence and expiry match that model-plus-host profile; read `model-deltas.md` for policy. Otherwise use the same routes with tighter verification cadence. An in-episode clean streak may enlarge increments for that episode; it does not create a persistent model profile.
+Record the actual model, host, effort, capabilities, tool surface, and Skill digest in each episode. Apply an entry from `references/model-deltas.json` only when its evidence and expiry match that model-plus-host profile; read `references/model-deltas.md` for policy. Otherwise use the same routes with tighter verification cadence. An in-episode clean streak may enlarge increments for that episode; it does not create a persistent model profile.
 
 ## Improvement protocol
 
-Write observed routing or verification failures to `.workloop/proposals/<date>-<slug>.md`; do not edit the installed Skill during task execution. Promotion requires:
+The Skill may propose one typed, bounded improvement; it never edits itself during a task (P5). Record observed routing or verification failures as you work, but make no Skill edit in that task. Promotion is a separate, human-run episode: freeze a `workloop-improvement-proposal/2`, then bind four evidence classes (`public`, `held-in`, `held-out`, `audit-held-out`) through a validated proposal, an append-only search ledger, and a fail-closed `decide-promotion` gate that still leaves human approval and the version bump as separate steps (P6).
 
-1. A failure-derived held-in case.
-2. Bare/previous/candidate paired runs on the same fixture and runtime envelope.
-3. Public regression success plus a private held-out suite unavailable to the proposer.
-4. Codex standalone conformance when the change touches delegation, capability discovery, routes, or fallback behavior.
-5. Human approval and version bump.
-
-Keep rejected changes and negative runs as regression evidence.
-
-Eval evidence is immutable and role-separated. `scripts/run-evals` binds the exact
-Skill, adapter runtime, dataset evidence class, cases, host, model profile, and
-runtime envelope; the producing adapter cannot grade behavior or regression
-output. Prefer `scripts/run-matrix` to collect, independently grade, and compare
-bare/previous/candidate through an append-only resumable stage log. External
-datasets must explicitly and consistently declare `public`, `held-in`, or
-`held-out`; expected labels never enter producer requests.
-
-Apply `scripts/decide-promotion` to public and proposer-blind held-out comparison
-artifacts. It fails closed on missing evidence, candidate drift, regression,
-insufficient trials, or resource-policy failure. An eligible result never
-authorizes promotion: human approval and the version bump remain separate gates.
+Full procedure, commands, and the protected-surface list: `references/improvement.md`.
 
 ## File map
 
@@ -175,4 +158,6 @@ authorizes promotion: human approval and the version bump remain separate gates.
 | Measured model behavior | `references/model-deltas.md`, `references/model-deltas.json` |
 | Codex-only compatibility | `evals/profiles/codex-standalone.json`, `evals/standalone-cases.json` |
 | Episode lifecycle and tracked-state redaction | `scripts/create-episode`, `scripts/episode-state`, `scripts/check-episode` |
-| Collection, independent review, paired comparison, promotion | `scripts/run-matrix`, `scripts/run-evals`, `scripts/grade-evals`, `scripts/compare-evals`, `scripts/decide-promotion`, `evals/matrix-protocol.md` |
+| Deterministic release, manifest, and checksum | `scripts/package-skill`, `packaging.allowlist` |
+| Self-improvement procedure and protected surfaces | `references/improvement.md`, `evals/proposal-contract.md`, `evals/editable-surfaces.json`, `scripts/validate-proposal` |
+| Collection, sealed private evaluation, search accounting, comparison, promotion | `scripts/run-matrix`, `scripts/run-sealed-matrix`, `scripts/search-ledger`, `scripts/run-evals`, `scripts/grade-evals`, `scripts/compare-evals`, `scripts/decide-promotion`, `evals/matrix-protocol.md` |

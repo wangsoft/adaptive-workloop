@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Regenerate the checked-in example through the real episode lifecycle."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_EXAMPLE = ROOT / "examples" / "verified-invoice-rounding"
+AUTHORED_FILES = ("contract.md", "checks.json", "progress.md", "handoff.md")
+DERIVED_FILES = ("manifest.json", "state.json", "events.jsonl")
+TASK = "Add rounding to invoice totals with a regression test"
+DEFAULT_MODEL = "fixture-future-model"
+
+
+class RegenError(RuntimeError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=SOURCE_EXAMPLE,
+        help="snapshot destination (default: checked-in example)",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="self-reported fixture model stored in the example manifest",
+    )
+    return parser.parse_args()
+
+
+def run(*argv: str) -> None:
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        argv,
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RegenError(f"command failed ({' '.join(argv)}): {detail}")
+
+
+def require_authored_inputs() -> None:
+    missing = [name for name in AUTHORED_FILES if not (SOURCE_EXAMPLE / name).is_file()]
+    if missing:
+        raise RegenError(f"missing authored example inputs: {missing}")
+
+
+def confined_episode(path: Path, local_root: Path) -> Path:
+    resolved = path.resolve()
+    if resolved.parent != local_root.resolve() or not resolved.is_dir():
+        raise RegenError(f"generated episode escaped .workloop/local: {resolved}")
+    return resolved
+
+
+def build_episode(model: str) -> Path:
+    local_root = ROOT / ".workloop" / "local"
+    before = {path.resolve() for path in local_root.glob("*") if path.is_dir()}
+    slug = f"regen-example-{uuid.uuid4().hex[:8]}"
+    try:
+        run(
+            str(ROOT / "scripts" / "create-episode"),
+            "--task",
+            TASK,
+            "--route",
+            "verified",
+            "--model",
+            model,
+            "--slug",
+            slug,
+            "--dir",
+            str(ROOT),
+            "--storage",
+            "local",
+        )
+    except BaseException:
+        for path in local_root.glob(f"*-{slug}*"):
+            if path.is_dir() and path.resolve() not in before:
+                candidate = confined_episode(path, local_root)
+                shutil.rmtree(candidate, ignore_errors=True)
+        raise
+    created = [
+        path
+        for path in local_root.glob(f"*-{slug}*")
+        if path.is_dir() and path.resolve() not in before
+    ]
+    if len(created) != 1:
+        for path in created:
+            candidate = confined_episode(path, local_root)
+            shutil.rmtree(candidate, ignore_errors=True)
+        raise RegenError(
+            f"expected one generated episode for {slug}, found {len(created)}"
+        )
+    episode = confined_episode(created[0], local_root)
+    try:
+        for name in AUTHORED_FILES:
+            shutil.copy2(SOURCE_EXAMPLE / name, episode / name)
+        run(
+            str(ROOT / "scripts" / "episode-state"),
+            str(episode),
+            "--status",
+            "in_progress",
+            "--kind",
+            "work.started",
+        )
+        run(str(ROOT / "scripts" / "verify-contract"), str(episode))
+        run(
+            str(ROOT / "scripts" / "episode-state"),
+            str(episode),
+            "--status",
+            "verified",
+            "--kind",
+            "verification.passed",
+            "--evidence",
+            "evidence/grading.json",
+        )
+        run(
+            str(ROOT / "scripts" / "episode-state"),
+            str(episode),
+            "--status",
+            "complete",
+            "--kind",
+            "episode.closed",
+        )
+    except BaseException:
+        shutil.rmtree(episode, ignore_errors=True)
+        raise
+    return episode
+
+
+def stage_snapshot(episode: Path, output: Path) -> tuple[Path, Path]:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    stage_parent = Path(
+        tempfile.mkdtemp(prefix=f".{output.name}-regen-", dir=output.parent)
+    )
+    stage = stage_parent / output.name
+    try:
+        stage.mkdir()
+        for name in AUTHORED_FILES:
+            shutil.copy2(SOURCE_EXAMPLE / name, stage / name)
+        for name in DERIVED_FILES:
+            shutil.copy2(episode / name, stage / name)
+        shutil.copytree(episode / "evidence", stage / "evidence")
+        run(str(ROOT / "scripts" / "check-episode"), str(stage))
+        run(str(ROOT / "scripts" / "verify-contract"), str(stage), "--dry-run")
+    except BaseException:
+        shutil.rmtree(stage_parent, ignore_errors=True)
+        raise
+    return stage_parent, stage
+
+
+def publish_snapshot(stage: Path, output: Path) -> None:
+    if output.is_symlink():
+        raise RegenError(f"refusing to replace symlinked output: {output}")
+    if output.exists() and not output.is_dir():
+        raise RegenError(f"output exists and is not a directory: {output}")
+    if not output.exists():
+        os.replace(stage, output)
+        return
+
+    backup = output.with_name(f".{output.name}.backup-{uuid.uuid4().hex}")
+    os.replace(output, backup)
+    try:
+        os.replace(stage, output)
+    except BaseException:
+        os.replace(backup, output)
+        raise
+    shutil.rmtree(backup)
+
+
+def main() -> int:
+    args = parse_args()
+    output = args.output.expanduser().resolve()
+    require_authored_inputs()
+    episode: Path | None = None
+    stage_parent: Path | None = None
+    try:
+        episode = build_episode(args.model)
+        stage_parent, stage = stage_snapshot(episode, output)
+        publish_snapshot(stage, output)
+    except (OSError, RegenError) as exc:
+        print(f"regen-example: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if episode is not None:
+            local_root = (ROOT / ".workloop" / "local").resolve()
+            if episode.parent == local_root:
+                shutil.rmtree(episode, ignore_errors=True)
+        if stage_parent is not None:
+            shutil.rmtree(stage_parent, ignore_errors=True)
+
+    print(f"regenerated: {output}")
+    print("note: volatile timestamps and durations make each snapshot byte-distinct")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

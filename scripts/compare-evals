@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any
 
 sys.dont_write_bytecode = True
-from workloop_core import canonical_json_digest, file_digest  # noqa: E402
+from workloop_core import (  # noqa: E402
+    atomic_write_text,
+    canonical_json_digest,
+    file_digest,
+    proposal_validation_binding,
+)
 
 
 ARTIFACT_ID_RE = re.compile(r"^case-[0-9]{3,}$")
@@ -27,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bare", required=True, type=Path)
     parser.add_argument("--previous", type=Path)
     parser.add_argument("--candidate", required=True, type=Path)
+    parser.add_argument("--proposal-validation", type=Path)
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -484,6 +490,7 @@ def paired_delta(
     candidate_metrics = metrics["candidate"]
     baseline_label = baseline["manifest"]["condition"]
     baseline_metrics = metrics[baseline_label]
+    discordant = wins + losses
     return {
         "pass_rate": round(
             candidate_metrics["pass_rate"] - baseline_metrics["pass_rate"], 6
@@ -491,7 +498,13 @@ def paired_delta(
         "paired_trials": {
             "candidate_wins": wins,
             "candidate_losses": losses,
+            "candidate_net_wins": wins - losses,
             "ties": ties,
+            "discordant_trials": discordant,
+            "candidate_win_rate": (round(wins / discordant, 6) if discordant else None),
+            "candidate_win_rate_wilson_95": (
+                wilson_interval(wins, discordant) if discordant else None
+            ),
         },
     }
 
@@ -504,6 +517,25 @@ def main() -> int:
     try:
         runs = {label: load_run(label, path) for label, path in paths.items()}
         envelope = ensure_compatible(runs)
+        proposal_binding = None
+        if args.proposal_validation is not None:
+            if "previous" not in runs:
+                raise ComparisonError(
+                    "proposal validation requires a previous comparison condition"
+                )
+            try:
+                proposal_binding = proposal_validation_binding(
+                    args.proposal_validation,
+                    validator_path=Path(__file__).resolve().parent
+                    / "validate-proposal",
+                    base_skill_digest=runs["previous"]["manifest"]["skill"]["digest"],
+                    candidate_skill_digest=runs["candidate"]["manifest"]["skill"][
+                        "digest"
+                    ],
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ComparisonError(str(exc)) from exc
+        envelope["proposal_validation"] = proposal_binding
         metrics = {label: condition_metrics(run) for label, run in runs.items()}
         deltas = {
             "candidate_vs_bare": paired_delta(runs["candidate"], runs["bare"], metrics)
@@ -525,7 +557,7 @@ def main() -> int:
     report["digest"] = canonical_json_digest(report)
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output:
-        args.output.write_text(rendered, encoding="utf-8")
+        atomic_write_text(args.output, rendered)
         print(f"compare-evals: {args.output}")
     else:
         print(rendered, end="")

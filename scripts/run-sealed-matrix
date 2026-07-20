@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Run a held-out matrix through a narrow, path-scoped broker entrypoint."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+from typing import Any
+
+
+EVIDENCE_CLASSES = {"held-out", "audit-held-out"}
+FORBIDDEN_MATRIX_ARGS = {
+    "--dataset",
+    "--evidence-class",
+    "--proposal-validation",
+    "--output",
+}
+
+
+class BrokerError(ValueError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", required=True, type=Path)
+    parser.add_argument(
+        "--evidence-class", required=True, choices=sorted(EVIDENCE_CLASSES)
+    )
+    parser.add_argument("--proposal-validation", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("matrix_args", nargs=argparse.REMAINDER)
+    return parser.parse_args()
+
+
+def within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def load_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BrokerError(f"{label}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise BrokerError(f"{label} must be a JSON object")
+    return value
+
+
+def main() -> int:
+    args = parse_args()
+    root = Path(__file__).resolve().parent.parent
+    try:
+        dataset_input = args.dataset.expanduser()
+        if dataset_input.is_symlink():
+            raise BrokerError("held-out dataset must not be a symlink")
+        dataset = dataset_input.resolve()
+        validation_path = args.proposal_validation.expanduser().resolve()
+        output = args.output.expanduser().resolve()
+        if within(dataset, root):
+            raise BrokerError("held-out dataset must remain outside the Skill checkout")
+        if within(dataset, output) or within(output, dataset):
+            raise BrokerError("held-out dataset and output must use separate roots")
+        if not dataset.is_file():
+            raise BrokerError("held-out dataset must be a regular file")
+        mode = stat.S_IMODE(dataset.stat().st_mode)
+        if mode & 0o077:
+            raise BrokerError("held-out dataset must be private (chmod 0600)")
+        dataset_value = load_json(dataset, "dataset")
+        if dataset_value.get("evidence_class") != args.evidence_class:
+            raise BrokerError("dataset evidence_class does not match broker request")
+        if dataset_value.get("held_out") is not True:
+            raise BrokerError("sealed dataset must declare held_out=true")
+        audit = args.evidence_class == "audit-held-out"
+        if dataset_value.get("audit_holdout", False) is not audit:
+            raise BrokerError("dataset audit_holdout label is inconsistent")
+        validation = load_json(validation_path, "proposal validation")
+        if (
+            validation.get("schema") != "workloop-proposal-validation/1"
+            or validation.get("status") != "validated"
+            or validation.get("promotion_authorized") is not False
+        ):
+            raise BrokerError("proposal validation is not eligible for evaluation")
+        matrix_args = list(args.matrix_args)
+        if matrix_args[:1] == ["--"]:
+            matrix_args = matrix_args[1:]
+        if not matrix_args:
+            raise BrokerError("matrix arguments are required after --")
+        if any(item in FORBIDDEN_MATRIX_ARGS for item in matrix_args):
+            raise BrokerError("broker-owned matrix arguments cannot be overridden")
+        argv = [
+            str(root / "scripts" / "run-matrix"),
+            *matrix_args,
+            "--dataset",
+            str(dataset),
+            "--evidence-class",
+            args.evidence_class,
+            "--proposal-validation",
+            str(validation_path),
+            "--output",
+            str(output),
+        ]
+    except BrokerError as exc:
+        print(f"run-sealed-matrix: {exc}", file=sys.stderr)
+        return 2
+    os.execv(argv[0], argv)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

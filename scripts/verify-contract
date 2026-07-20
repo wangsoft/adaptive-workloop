@@ -15,6 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.dont_write_bytecode = True
+from workloop_core import scan_episode_placeholders  # noqa: E402
+
 
 SCHEMA = "workloop-checks/1"
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -38,6 +41,13 @@ BLOCKED_EXECUTABLES = {
 }
 INLINE_CODE_FLAGS = {"-c", "-e", "--eval"}
 MAX_CAPTURE_BYTES = 256_000
+HOLLOW_TEST_PATTERNS = (
+    re.compile(r"(?i)\bcollected\s+0\s+items?\b"),
+    re.compile(r"(?i)\bran\s+0\s+tests?\b"),
+    re.compile(r"(?i)\b0\s+tests?\s+(?:run|passed|executed)\b"),
+    re.compile(r"(?i)\bno\s+tests?\s+(?:found|collected|executed)\b"),
+    re.compile(r"(?i)\b0\s+passing\b"),
+)
 
 
 class ContractError(ValueError):
@@ -247,14 +257,27 @@ def execute_check(check: dict[str, Any]) -> dict[str, Any]:
             for pattern in check["output_must_match"]
             if re.search(pattern, combined) is None
         ]
-        passed = result.returncode == check["expected_exit"] and not missing_patterns
-        terminal = "pass" if passed else "fail"
+        test_signal = " ".join([check["description"], *check["argv"]]).lower()
+        hollow_patterns = [
+            pattern.pattern
+            for pattern in HOLLOW_TEST_PATTERNS
+            if "test" in test_signal and pattern.search(combined) is not None
+        ]
+        passed = (
+            result.returncode == check["expected_exit"]
+            and not missing_patterns
+            and not hollow_patterns
+        )
+        terminal = "pass" if passed else ("hollow_pass" if hollow_patterns else "fail")
         returncode: int | None = result.returncode
-        error = None
+        error = (
+            "successful exit reported no tests exercised" if hollow_patterns else None
+        )
     except subprocess.TimeoutExpired as exc:
         stdout, stdout_truncated = bounded(exc.stdout or "")
         stderr, stderr_truncated = bounded(exc.stderr or "")
         missing_patterns = check["output_must_match"]
+        hollow_patterns = []
         passed = False
         terminal = "timeout"
         returncode = None
@@ -271,6 +294,7 @@ def execute_check(check: dict[str, Any]) -> dict[str, Any]:
         "returncode": returncode,
         "expected_exit": check["expected_exit"],
         "missing_output_patterns": missing_patterns,
+        "hollow_output_patterns": hollow_patterns,
         "stdout": stdout,
         "stderr": stderr,
         "output_truncated": stdout_truncated or stderr_truncated,
@@ -303,6 +327,16 @@ def main() -> int:
     try:
         checks_path, episode, root = resolve_target(args.target)
         contract = load_contract(checks_path)
+        if (episode / "manifest.json").is_file():
+            placeholders = scan_episode_placeholders(episode)
+            if placeholders:
+                first = placeholders[0]
+                location = first["path"]
+                if first["line"] is not None:
+                    location += f":{first['line']}"
+                raise ContractError(
+                    f"unfilled placeholder in {location}: {first['rule']}"
+                )
         allowed_risks = {"workspace-local", *args.allow_risk}
         checks = [
             validate_check(raw, index, root, allowed_risks)

@@ -1,0 +1,17 @@
+{
+  "name": "adaptive-workloop",
+  "owner": {
+    "name": "Leo Wang"
+  },
+  "metadata": {
+    "description": "Risk-based process router for AI coding agents",
+    "version": "0.6.0"
+  },
+  "plugins": [
+    {
+      "name": "adaptive-workloop",
+      "description": "Route non-trivial engineering work through the smallest loop that can prove completion. Probes host capability and task risk, then routes to Direct, Verified, Reviewed, or Distributed.",
+      "source": "./"
+    }
+  ]
+}

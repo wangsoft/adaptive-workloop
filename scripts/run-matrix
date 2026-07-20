@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,15 +16,22 @@ from typing import Any
 sys.dont_write_bytecode = True
 from workloop_core import (  # noqa: E402
     BoundedCommandError,
+    acquire_exclusive_file_lock,
     adapter_runtime_digest,
+    atomic_write_text,
     canonical_json_digest,
     file_digest,
+    proposal_validation_binding,
+    redact_evidence_text,
+    release_file_lock,
     run_bounded_command,
+    secure_directory,
     skill_runtime_digest,
 )
 
 
 CONDITIONS = ("bare", "previous", "candidate")
+EVIDENCE_CLASSES = ("public", "held-in", "held-out", "audit-held-out")
 REVIEWED_SUITES = {"behavior", "regression"}
 SAFE_ENV = ("LANG", "LC_ALL", "LC_CTYPE", "PATH", "TEMP", "TMP", "TMPDIR")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -41,12 +49,13 @@ def parse_args() -> argparse.Namespace:
         choices=("trigger", "behavior", "regression", "standalone"),
     )
     parser.add_argument("--dataset", type=Path)
-    parser.add_argument("--evidence-class", choices=("public", "held-in", "held-out"))
+    parser.add_argument("--evidence-class", choices=EVIDENCE_CLASSES)
     parser.add_argument("--case", action="append", default=[])
     parser.add_argument("--adapter", required=True, type=Path)
     parser.add_argument("--grader", type=Path)
     parser.add_argument("--grader-profile", default="unspecified")
     parser.add_argument("--previous-skill", required=True, type=Path)
+    parser.add_argument("--proposal-validation", type=Path)
     parser.add_argument("--model-profile", default="unspecified")
     parser.add_argument("--host-profile")
     parser.add_argument("--trials", type=int, default=1)
@@ -75,10 +84,7 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    atomic_write_text(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
 def selected_environment(requested: list[str]) -> tuple[dict[str, str], list[str]]:
@@ -114,9 +120,12 @@ def dataset_binding(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     value = load_json(path)
     if value.get("suite") != f"adaptive-workloop/{args.suite}":
         raise MatrixError("dataset suite label mismatch")
+    hidden = evidence_class in {"held-out", "audit-held-out"}
+    audit = evidence_class == "audit-held-out"
     if origin == "external" and (
         value.get("evidence_class") != evidence_class
-        or value.get("held_out") is not (evidence_class == "held-out")
+        or value.get("held_out") is not hidden
+        or value.get("audit_holdout", False) is not audit
     ):
         raise MatrixError("external dataset evidence class binding mismatch")
     return {
@@ -124,7 +133,8 @@ def dataset_binding(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "digest": file_digest(path),
         "evidence_class": evidence_class,
         "origin": origin,
-        "held_out": evidence_class == "held-out",
+        "held_out": hidden,
+        "audit_holdout": audit,
     }
 
 
@@ -133,6 +143,55 @@ def executable_binding(path: Path, label: str) -> dict[str, str]:
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
         raise MatrixError(f"{label} is not executable: {resolved}")
     return {"path": str(resolved), "digest": adapter_runtime_digest(resolved)}
+
+
+def revalidate_proposal_attestation(
+    root: Path,
+    previous: Path,
+    validation_path: Path,
+    binding: dict[str, Any],
+) -> None:
+    """Require the current validator to reproduce an untrusted attestation."""
+
+    environment = {name: os.environ[name] for name in SAFE_ENV if name in os.environ}
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    with tempfile.TemporaryDirectory(prefix="workloop-proposal-") as tmp:
+        output = Path(tmp) / "validation.json"
+        try:
+            result = run_bounded_command(
+                [
+                    sys.executable,
+                    str(root / "scripts" / "validate-proposal"),
+                    "--proposal",
+                    binding["proposal_path"],
+                    "--registry",
+                    binding["registry_path"],
+                    "--previous-skill",
+                    str(previous),
+                    "--candidate-skill",
+                    str(root),
+                    "--output",
+                    str(output),
+                ],
+                input_bytes=b"",
+                environment=environment,
+                timeout_seconds=60,
+                max_output_bytes=64 * 1024,
+                cwd=root,
+            )
+        except BoundedCommandError as exc:
+            raise MatrixError(f"fresh proposal validation failed: {exc}") from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise MatrixError(
+                "fresh proposal validation failed" + (f": {detail}" if detail else "")
+            )
+        original = load_json(validation_path.expanduser().resolve())
+        reproduced = load_json(output)
+        if reproduced != original:
+            raise MatrixError(
+                "fresh proposal validation does not reproduce the attestation"
+            )
 
 
 def build_manifest(
@@ -153,8 +212,39 @@ def build_manifest(
         raise MatrixError(f"suite {args.suite} does not use --grader")
     scripts = {
         name: file_digest(root / "scripts" / name)
-        for name in ("run-matrix", "run-evals", "grade-evals", "compare-evals")
+        for name in (
+            "run-matrix",
+            "run-evals",
+            "grade-evals",
+            "compare-evals",
+            "validate-proposal",
+        )
     }
+    skills = {
+        "bare": None,
+        "previous": {
+            "path": str(previous),
+            "digest": skill_runtime_digest(previous),
+        },
+        "candidate": {
+            "path": str(root.resolve()),
+            "digest": skill_runtime_digest(root),
+        },
+    }
+    proposal_binding = None
+    if args.proposal_validation is not None:
+        try:
+            proposal_binding = proposal_validation_binding(
+                args.proposal_validation,
+                validator_path=root / "scripts" / "validate-proposal",
+                base_skill_digest=skills["previous"]["digest"],
+                candidate_skill_digest=skills["candidate"]["digest"],
+            )
+        except ValueError as exc:
+            raise MatrixError(str(exc)) from exc
+        revalidate_proposal_attestation(
+            root, previous, args.proposal_validation, proposal_binding
+        )
     manifest = {
         "schema": "workloop-eval-matrix/1",
         "created_at": utc_now(),
@@ -175,17 +265,8 @@ def build_manifest(
             "dataset": dataset_binding(root, args),
             "adapter": adapter,
             "grader": grader,
-            "skills": {
-                "bare": None,
-                "previous": {
-                    "path": str(previous),
-                    "digest": skill_runtime_digest(previous),
-                },
-                "candidate": {
-                    "path": str(root.resolve()),
-                    "digest": skill_runtime_digest(root),
-                },
-            },
+            "skills": skills,
+            "proposal_validation": proposal_binding,
             "scripts": scripts,
         },
     }
@@ -270,12 +351,14 @@ def run_stage_command(
         )
     except BoundedCommandError as exc:
         raise MatrixError(f"stage command {command_digest} {exc.kind}: {exc}") from exc
-    log_prefix.parent.mkdir(parents=True, exist_ok=True)
-    (log_prefix.parent / f"{log_prefix.name}.stdout.txt").write_text(
-        result.stdout, encoding="utf-8"
+    secure_directory(log_prefix.parent)
+    atomic_write_text(
+        log_prefix.parent / f"{log_prefix.name}.stdout.txt",
+        redact_evidence_text(result.stdout, environment=environment),
     )
-    (log_prefix.parent / f"{log_prefix.name}.stderr.txt").write_text(
-        result.stderr, encoding="utf-8"
+    atomic_write_text(
+        log_prefix.parent / f"{log_prefix.name}.stderr.txt",
+        redact_evidence_text(result.stderr, environment=environment),
     )
     return result.returncode
 
@@ -555,9 +638,12 @@ def compare_runs(
         str(runs["previous"]),
         "--candidate",
         str(runs["candidate"]),
-        "--output",
-        str(comparison),
     ]
+    if args.proposal_validation is not None:
+        command.extend(
+            ["--proposal-validation", str(args.proposal_validation.resolve())]
+        )
+    command.extend(["--output", str(comparison)])
     append_event(
         output / "events.jsonl",
         events,
@@ -602,9 +688,17 @@ def main() -> int:
     args = parse_args()
     root = Path(__file__).resolve().parent.parent
     output = args.output.expanduser().resolve()
+    lock_handle = None
     try:
         environment, passed_env = selected_environment(args.pass_env)
         expected_manifest = build_manifest(root, args, passed_env)
+        if output.exists() and not output.is_dir():
+            raise MatrixError(f"output is not a directory: {output}")
+        secure_directory(output)
+        try:
+            lock_handle = acquire_exclusive_file_lock(output / ".matrix.lock")
+        except RuntimeError as exc:
+            raise MatrixError(str(exc)) from exc
         manifest_path = output / "matrix-manifest.json"
         if args.resume:
             if not manifest_path.is_file():
@@ -613,9 +707,8 @@ def main() -> int:
             if not compatible_manifest(manifest, expected_manifest):
                 raise MatrixError("resume configuration or bound evidence has changed")
         else:
-            if output.exists() and any(output.iterdir()):
+            if any(path.name != ".matrix.lock" for path in output.iterdir()):
                 raise MatrixError(f"output directory is not empty: {output}")
-            output.mkdir(parents=True, exist_ok=True)
             manifest = expected_manifest
             write_json(manifest_path, manifest)
         events = load_events(output / "events.jsonl")
@@ -670,6 +763,9 @@ def main() -> int:
     except MatrixError as exc:
         print(f"run-matrix: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if lock_handle is not None:
+            release_file_lock(lock_handle)
     print(f"run-matrix: {output / 'matrix-result.json'}")
     return 0
 

@@ -1,14 +1,26 @@
 {
-  "schema": "workloop-promotion-policy/1",
+  "schema": "workloop-promotion-policy/2",
   "required_evidence_classes": [
     "public",
-    "held-out"
+    "held-in",
+    "held-out",
+    "audit-held-out"
   ],
-  "min_total_trials_per_condition": 3,
+  "min_total_trials_per_condition": 10,
   "min_candidate_pass_rate": 0.8,
   "min_candidate_pass_rate_delta_vs_previous": 0.0,
   "max_candidate_losses_vs_previous": 0,
+  "required_improvement_evidence_class": "held-in",
+  "min_improvement_pass_rate_delta": 0.05,
+  "min_improvement_paired_net_wins": 1,
+  "min_improvement_paired_win_rate_lower_95": 0.5,
+  "max_candidates_considered": 4,
+  "max_search_rounds": 3,
+  "max_held_out_comparisons": 1,
+  "max_audit_held_out_comparisons": 1,
+  "require_observed_model_identity": true,
+  "require_distinct_grader_observed_model": true,
   "max_combined_token_ratio_vs_previous": 1.5,
-  "max_combined_cost_ratio_vs_previous": null,
+  "max_combined_cost_ratio_vs_previous": 1.5,
   "human_approval_required": true
 }

@@ -29,7 +29,9 @@
         "route": "verified",
         "terminal": "complete",
         "degradation": "host-native-verified",
-        "required_artifacts": ["evidence/grading.json"]
+        "required_artifacts": [
+          "evidence/grading.json"
+        ]
       }
     },
     {
@@ -43,7 +45,9 @@
         "route": "reviewed",
         "terminal": "needs_human",
         "degradation": "labeled-self-review",
-        "required_artifacts": ["review.md"]
+        "required_artifacts": [
+          "review.md"
+        ]
       }
     },
     {
@@ -57,7 +61,10 @@
         "route": "distributed",
         "terminal": "complete",
         "degradation": "durable-serial",
-        "required_artifacts": ["state.json", "progress.md"]
+        "required_artifacts": [
+          "state.json",
+          "progress.md"
+        ]
       }
     }
   ]

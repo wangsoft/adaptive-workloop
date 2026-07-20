@@ -1,0 +1,29 @@
+{
+  "argv": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    ".",
+    "-p",
+    "test_invoice_rounding.py",
+    "-v"
+  ],
+  "cwd": "examples/fixtures/invoice-rounding",
+  "description": "focused invoice rounding tests exercise boundary, tax, and decimal behavior",
+  "duration_ms": 69,
+  "error": null,
+  "expected_exit": 0,
+  "hollow_output_patterns": [],
+  "id": "invoice-rounding-tests",
+  "missing_output_patterns": [],
+  "output_truncated": false,
+  "passed": true,
+  "returncode": 0,
+  "risk": "workspace-local",
+  "started_at": "2026-07-20T06:55:16Z",
+  "stderr": "test_applies_tax_before_rounding (test_invoice_rounding.InvoiceRoundingTests.test_applies_tax_before_rounding) ... ok\ntest_decimal_input_avoids_binary_float_drift (test_invoice_rounding.InvoiceRoundingTests.test_decimal_input_avoids_binary_float_drift) ... ok\ntest_rounds_half_up_at_the_currency_boundary (test_invoice_rounding.InvoiceRoundingTests.test_rounds_half_up_at_the_currency_boundary) ... ok\n\n----------------------------------------------------------------------\nRan 3 tests in 0.000s\n\nOK\n",
+  "stdout": "",
+  "terminal": "pass"
+}

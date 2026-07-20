@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Create and append an integrity-checked Harness-improvement search ledger."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+sys.dont_write_bytecode = True
+from workloop_search import (  # noqa: E402
+    SearchLedgerError,
+    append_search_event,
+    comparison_record,
+    initialize_search_ledger,
+    validate_search_ledger,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    init = subparsers.add_parser("init")
+    init.add_argument("--ledger", required=True, type=Path)
+    init.add_argument("--search-id", required=True)
+    init.add_argument("--base-skill-digest", required=True)
+    record = subparsers.add_parser("record")
+    record.add_argument("--ledger", required=True, type=Path)
+    record.add_argument("--comparison", required=True, type=Path)
+    close = subparsers.add_parser("close")
+    close.add_argument("--ledger", required=True, type=Path)
+    close.add_argument("--candidate-skill-digest", required=True)
+    close.add_argument("--status", required=True, choices=("rejected", "selected"))
+    close.add_argument("--reason", required=True)
+    validate = subparsers.add_parser("validate")
+    validate.add_argument("--ledger", required=True, type=Path)
+    validate.add_argument("--require-closed", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.command == "init":
+            initialize_search_ledger(
+                args.ledger,
+                search_id=args.search_id,
+                base_skill_digest=args.base_skill_digest,
+            )
+            print(f"search-ledger: initialized: {args.ledger.resolve()}")
+            return 0
+        if args.command == "record":
+            record = comparison_record(args.comparison)
+
+            def payload(summary: dict[str, Any]) -> dict[str, Any]:
+                selected = summary.get("selected_candidate")
+                if selected is not None:
+                    raise SearchLedgerError("search is already closed by selection")
+                if record["base_skill_digest"] != summary["base_skill_digest"]:
+                    raise SearchLedgerError("comparison base Skill differs from ledger")
+                if any(
+                    item["digest"] == record["digest"]
+                    for item in summary["comparisons"]
+                ):
+                    raise SearchLedgerError("comparison is already recorded")
+                for candidate in summary["candidates"]:
+                    if (
+                        candidate["candidate_skill_digest"]
+                        == record["candidate_skill_digest"]
+                        and candidate["status"] != "open"
+                    ):
+                        raise SearchLedgerError("candidate is already closed")
+                return {"comparison": record}
+
+            append_search_event(
+                args.ledger, kind="comparison.recorded", build_payload=payload
+            )
+            print(f"search-ledger: recorded: {record['digest']}")
+            return 0
+        if args.command == "close":
+
+            def payload(summary: dict[str, Any]) -> dict[str, Any]:
+                candidate = next(
+                    (
+                        item
+                        for item in summary["candidates"]
+                        if item["candidate_skill_digest"] == args.candidate_skill_digest
+                    ),
+                    None,
+                )
+                if candidate is None or candidate["status"] != "open":
+                    raise SearchLedgerError("candidate is missing or already closed")
+                if (
+                    args.status == "selected"
+                    and summary["selected_candidate"] is not None
+                ):
+                    raise SearchLedgerError("a candidate is already selected")
+                if not args.reason.strip():
+                    raise SearchLedgerError("--reason must be non-empty")
+                return {
+                    "candidate_skill_digest": args.candidate_skill_digest,
+                    "status": args.status,
+                    "reason": args.reason.strip(),
+                }
+
+            append_search_event(
+                args.ledger, kind="candidate.closed", build_payload=payload
+            )
+            print(f"search-ledger: {args.status}: {args.candidate_skill_digest}")
+            return 0
+        summary = validate_search_ledger(
+            args.ledger, require_closed=args.require_closed
+        )
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0
+    except SearchLedgerError as exc:
+        print(f"search-ledger: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

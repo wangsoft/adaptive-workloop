@@ -15,9 +15,12 @@ sys.dont_write_bytecode = True
 from workloop_core import (  # noqa: E402
     BoundedCommandError,
     adapter_runtime_digest,
+    atomic_write_text,
     canonical_json_digest,
     file_digest,
+    redact_evidence_text,
     run_bounded_command,
+    secure_directory,
 )
 
 
@@ -62,9 +65,7 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, value: Any) -> None:
-    path.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    atomic_write_text(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
 def selected_environment(requested: list[str]) -> tuple[dict[str, str], list[str]]:
@@ -117,9 +118,12 @@ def validate_source(
     summary_dataset = summary.get("dataset", {})
     evidence_class = dataset_binding.get("evidence_class")
     if (
-        evidence_class not in {"public", "held-in", "held-out"}
+        evidence_class not in {"public", "held-in", "held-out", "audit-held-out"}
         or dataset_binding.get("origin") not in {"repository", "external"}
-        or dataset_binding.get("held_out") is not (evidence_class == "held-out")
+        or dataset_binding.get("held_out")
+        is not (evidence_class in {"held-out", "audit-held-out"})
+        or dataset_binding.get("audit_holdout", False)
+        is not (evidence_class == "audit-held-out")
         or summary_dataset.get("digest") != dataset_binding.get("digest")
         or summary_dataset.get("evidence_class") != evidence_class
         or summary_dataset.get("origin") != dataset_binding.get("origin")
@@ -139,17 +143,23 @@ def validate_source(
     dataset_value = load_json(dataset)
     declared_evidence_class = dataset_value.get("evidence_class")
     declared_held_out = dataset_value.get("held_out")
+    declared_audit_holdout = dataset_value.get("audit_holdout", False)
     if dataset_binding["origin"] == "repository":
         if dataset_arg is not None:
             raise GraderError("repository run must use its repository dataset")
-        if declared_evidence_class not in {None, "public"} or declared_held_out is True:
+        if (
+            declared_evidence_class not in {None, "public"}
+            or declared_held_out is True
+            or declared_audit_holdout is True
+        ):
             raise GraderError("repository dataset cannot claim hidden evidence")
     elif dataset_arg is None:
         raise GraderError("external source run requires --dataset")
     elif (
         declared_evidence_class != evidence_class
         or not isinstance(declared_held_out, bool)
-        or declared_held_out is not (evidence_class == "held-out")
+        or declared_held_out is not (evidence_class in {"held-out", "audit-held-out"})
+        or declared_audit_holdout is not (evidence_class == "audit-held-out")
     ):
         raise GraderError("external dataset evidence class does not match source run")
     cases = dataset_value.get("cases")
@@ -388,12 +398,12 @@ def main() -> int:
     review_cases: list[dict[str, Any]] = []
     counts = {"passed": 0, "failed": 0, "needs_human": 0, "errors": 0}
     reviews_dir = run_dir / "reviews"
-    reviews_dir.mkdir()
+    secure_directory(reviews_dir)
     for source_case in summary["cases"]:
         artifact_id = source_case["artifact_id"]
         case_dir = run_dir / "cases" / artifact_id
         review_dir = reviews_dir / artifact_id
-        review_dir.mkdir()
+        secure_directory(review_dir)
         producer_request = load_json(case_dir / "request.json")
         producer_response = load_json(case_dir / "response.json")
         producer_grading = load_json(case_dir / "grading.json")
@@ -435,7 +445,10 @@ def main() -> int:
             )
             response_path = review_dir / "response.json"
             write_json(response_path, response)
-            (review_dir / "grader.stderr.txt").write_text(stderr, encoding="utf-8")
+            atomic_write_text(
+                review_dir / "grader.stderr.txt",
+                redact_evidence_text(stderr, environment=environment),
+            )
             status = response["status"]
             counts[status] += 1
             review_record.update(
@@ -449,7 +462,10 @@ def main() -> int:
             )
         except GraderError as exc:
             counts["errors"] += 1
-            (review_dir / "error.txt").write_text(str(exc) + "\n", encoding="utf-8")
+            atomic_write_text(
+                review_dir / "error.txt",
+                redact_evidence_text(str(exc) + "\n", environment=environment),
+            )
             review_record["status"] = "error"
         review_cases.append(review_record)
 

@@ -7,6 +7,8 @@ import sys
 
 
 json.load(sys.stdin)
+if secret := os.environ.get("WORKLOOP_SECRET_CANARY"):
+    print(f"provider echoed token={secret}", file=sys.stderr)
 json.dump(
     {
         "schema": "workloop-adapter-response/1",

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import sys
@@ -11,10 +12,18 @@ from pathlib import Path
 from typing import Any
 
 sys.dont_write_bytecode = True
-from workloop_core import canonical_json_digest, file_digest  # noqa: E402
+from workloop_core import (  # noqa: E402
+    atomic_write_text,
+    canonical_json_digest,
+    file_digest,
+)
+from workloop_search import (  # noqa: E402
+    SearchLedgerError,
+    validate_search_ledger,
+)
 
 
-EVIDENCE_CLASSES = {"public", "held-in", "held-out"}
+EVIDENCE_CLASSES = {"public", "held-in", "held-out", "audit-held-out"}
 
 
 class PromotionError(ValueError):
@@ -25,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", required=True, type=Path)
     parser.add_argument("--comparison", required=True, action="append", type=Path)
+    parser.add_argument("--search-ledger", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     return parser.parse_args()
 
@@ -40,10 +50,7 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    atomic_write_text(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
 def number(value: Any, label: str, *, minimum: float | None = None) -> float:
@@ -60,7 +67,7 @@ def number(value: Any, label: str, *, minimum: float | None = None) -> float:
 
 
 def validate_policy(value: dict[str, Any]) -> dict[str, Any]:
-    allowed = {
+    common = {
         "schema",
         "required_evidence_classes",
         "min_total_trials_per_condition",
@@ -71,8 +78,26 @@ def validate_policy(value: dict[str, Any]) -> dict[str, Any]:
         "max_combined_cost_ratio_vs_previous",
         "human_approval_required",
     }
-    if value.get("schema") != "workloop-promotion-policy/1" or set(value) != allowed:
-        raise PromotionError("policy fields do not match workloop-promotion-policy/1")
+    schema = value.get("schema")
+    if schema == "workloop-promotion-policy/1":
+        allowed = common
+    elif schema == "workloop-promotion-policy/2":
+        allowed = common | {
+            "required_improvement_evidence_class",
+            "min_improvement_pass_rate_delta",
+            "min_improvement_paired_net_wins",
+            "min_improvement_paired_win_rate_lower_95",
+            "max_candidates_considered",
+            "max_search_rounds",
+            "max_held_out_comparisons",
+            "max_audit_held_out_comparisons",
+            "require_observed_model_identity",
+            "require_distinct_grader_observed_model",
+        }
+    else:
+        raise PromotionError("unsupported promotion policy schema")
+    if set(value) != allowed:
+        raise PromotionError(f"policy fields do not match {schema}")
     classes = value.get("required_evidence_classes")
     if (
         not isinstance(classes, list)
@@ -85,12 +110,32 @@ def validate_policy(value: dict[str, Any]) -> dict[str, Any]:
         "min_total_trials_per_condition",
         "max_candidate_losses_vs_previous",
     )
+    if schema == "workloop-promotion-policy/2":
+        integer_fields += (
+            "min_improvement_paired_net_wins",
+            "max_candidates_considered",
+            "max_search_rounds",
+            "max_held_out_comparisons",
+            "max_audit_held_out_comparisons",
+        )
     for field in integer_fields:
         field_value = value.get(field)
         if (
             not isinstance(field_value, int)
             or isinstance(field_value, bool)
-            or field_value < (1 if field.startswith("min_") else 0)
+            or field_value
+            < (
+                1
+                if field.startswith("min_")
+                or field
+                in {
+                    "max_candidates_considered",
+                    "max_search_rounds",
+                    "max_held_out_comparisons",
+                    "max_audit_held_out_comparisons",
+                }
+                else 0
+            )
         ):
             raise PromotionError(f"policy {field} is invalid")
     pass_rate = number(value.get("min_candidate_pass_rate"), "min_candidate_pass_rate")
@@ -110,6 +155,33 @@ def validate_policy(value: dict[str, Any]) -> dict[str, Any]:
     cost_ratio = value.get("max_combined_cost_ratio_vs_previous")
     if cost_ratio is not None:
         number(cost_ratio, "max_combined_cost_ratio_vs_previous", minimum=0)
+    if schema == "workloop-promotion-policy/2":
+        if value.get("required_improvement_evidence_class") != "held-in":
+            raise PromotionError(
+                "v2 required_improvement_evidence_class must be held-in"
+            )
+        if "held-in" not in classes:
+            raise PromotionError("v2 policy must require held-in evidence")
+        improvement_delta = number(
+            value.get("min_improvement_pass_rate_delta"),
+            "min_improvement_pass_rate_delta",
+        )
+        if not 0 < improvement_delta <= 1:
+            raise PromotionError("v2 improvement delta must be between 0 and 1")
+        confidence = number(
+            value.get("min_improvement_paired_win_rate_lower_95"),
+            "min_improvement_paired_win_rate_lower_95",
+        )
+        if not 0 <= confidence <= 1:
+            raise PromotionError("v2 paired confidence lower bound is invalid")
+        if cost_ratio is None:
+            raise PromotionError("v2 policy must enforce a numeric cost ratio")
+        for field in (
+            "require_observed_model_identity",
+            "require_distinct_grader_observed_model",
+        ):
+            if value.get(field) is not True:
+                raise PromotionError(f"v2 policy must set {field} to true")
     if value.get("human_approval_required") is not True:
         raise PromotionError("promotion policy must require human approval")
     return value
@@ -134,9 +206,15 @@ def validate_comparison(path: Path) -> dict[str, Any]:
     evidence_class = dataset.get("evidence_class")
     if (
         evidence_class not in EVIDENCE_CLASSES
-        or dataset.get("held_out") is not (evidence_class == "held-out")
+        or dataset.get("held_out")
+        is not (evidence_class in {"held-out", "audit-held-out"})
+        or dataset.get("audit_holdout", False)
+        is not (evidence_class == "audit-held-out")
         or dataset.get("origin") not in {"repository", "external"}
-        or (evidence_class == "held-out" and dataset.get("origin") != "external")
+        or (
+            evidence_class in {"held-out", "audit-held-out"}
+            and dataset.get("origin") != "external"
+        )
     ):
         raise PromotionError(f"{path}: comparison evidence class is invalid")
     candidate_digest = conditions["candidate"].get("skill_digest")
@@ -195,6 +273,168 @@ def ratio(candidate: float, previous: float) -> float | str:
     return round(candidate / previous, 6)
 
 
+def observed_identity_summary(
+    comparisons: list[dict[str, Any]],
+) -> dict[str, Any]:
+    producer_models: list[str] = []
+    grader_models: list[str] = []
+    producer_records = 0
+    grader_records = 0
+    producer_missing = 0
+    grader_missing = 0
+    grader_bindings: list[str] = []
+    grader_binding_missing = 0
+    for comparison in comparisons:
+        envelope = comparison.get("compatible_envelope", {})
+        producers = envelope.get("producer_runtime_identities")
+        if not isinstance(producers, list) or not producers:
+            producer_missing += 1
+        else:
+            for record in producers:
+                producer_records += 1
+                identity = record.get("identity") if isinstance(record, dict) else None
+                observed = (
+                    identity.get("observed_model")
+                    if isinstance(identity, dict)
+                    else None
+                )
+                if isinstance(observed, str) and observed.strip():
+                    producer_models.append(observed.strip())
+                else:
+                    producer_missing += 1
+
+        reviewer = envelope.get("reviewer")
+        grader = reviewer.get("grader") if isinstance(reviewer, dict) else None
+        if isinstance(grader, dict) and grader:
+            grader_bindings.append(canonical_json_digest(grader))
+        else:
+            grader_binding_missing += 1
+        observed_identities = (
+            reviewer.get("observed_identities") if isinstance(reviewer, dict) else None
+        )
+        if not isinstance(observed_identities, list) or not observed_identities:
+            grader_missing += 1
+        else:
+            for record in observed_identities:
+                grader_records += 1
+                identity = record.get("identity") if isinstance(record, dict) else None
+                observed = (
+                    identity.get("observed_model")
+                    if isinstance(identity, dict)
+                    else None
+                )
+                if isinstance(observed, str) and observed.strip():
+                    grader_models.append(observed.strip())
+                else:
+                    grader_missing += 1
+    return {
+        "producer_models": sorted(set(producer_models)),
+        "grader_models": sorted(set(grader_models)),
+        "producer_records": producer_records,
+        "grader_records": grader_records,
+        "producer_missing": producer_missing,
+        "grader_missing": grader_missing,
+        "grader_bindings": sorted(set(grader_bindings)),
+        "grader_binding_missing": grader_binding_missing,
+    }
+
+
+def normalized_proposal_binding(
+    comparison: dict[str, Any],
+) -> dict[str, Any] | None:
+    binding = comparison.get("compatible_envelope", {}).get("proposal_validation")
+    if binding is None:
+        return None
+    required = {
+        "digest",
+        "validator_digest",
+        "proposal_digest",
+        "registry_digest",
+        "base_skill_digest",
+        "candidate_skill_digest",
+        "surface_id",
+        "actual_changed_paths",
+        "search",
+        "budgets",
+    }
+    if not isinstance(binding, dict) or not required.issubset(binding):
+        raise PromotionError("comparison has an invalid proposal validation binding")
+    previous_digest = comparison["conditions"]["previous"]["skill_digest"]
+    candidate_digest = comparison["conditions"]["candidate"]["skill_digest"]
+    if (
+        binding.get("base_skill_digest") != previous_digest
+        or binding.get("candidate_skill_digest") != candidate_digest
+    ):
+        raise PromotionError("proposal validation does not bind comparison Skills")
+    for field in (
+        "digest",
+        "validator_digest",
+        "proposal_digest",
+        "registry_digest",
+        "base_skill_digest",
+        "candidate_skill_digest",
+    ):
+        if not isinstance(binding.get(field), str):
+            raise PromotionError(f"proposal validation {field} is invalid")
+    if (
+        not isinstance(binding.get("surface_id"), str)
+        or not isinstance(binding.get("actual_changed_paths"), list)
+        or not binding["actual_changed_paths"]
+        or not isinstance(binding.get("search"), dict)
+        or not isinstance(binding.get("budgets"), dict)
+    ):
+        raise PromotionError("proposal validation bounded-change metadata is invalid")
+    return {
+        field: binding[field]
+        for field in (
+            "digest",
+            "validator_digest",
+            "proposal_digest",
+            "registry_digest",
+            "base_skill_digest",
+            "candidate_skill_digest",
+            "surface_id",
+            "actual_changed_paths",
+            "search",
+            "budgets",
+        )
+    }
+
+
+def append_threshold_check(
+    checks: list[dict[str, Any]],
+    *,
+    gate: str,
+    actual: Any,
+    threshold: Any,
+    operator: str,
+    **context: Any,
+) -> None:
+    actual_number = finite_metric(actual)
+    threshold_number = finite_metric(threshold)
+    status = "inconclusive"
+    if actual_number is not None and threshold_number is not None:
+        if operator == ">=":
+            passed = actual_number >= threshold_number
+        elif operator == "<=":
+            passed = actual_number <= threshold_number
+        elif operator == "==":
+            passed = actual_number == threshold_number
+        else:
+            raise PromotionError(f"unsupported threshold operator: {operator}")
+        status = "passed" if passed else "failed"
+    checks.append(
+        {
+            "gate": gate,
+            "status": status,
+            "actual": actual,
+            "threshold": threshold,
+            "operator": operator,
+            **context,
+        }
+    )
+
+
 def main() -> int:
     args = parse_args()
     output = args.output.expanduser().resolve()
@@ -211,6 +451,27 @@ def main() -> int:
         }
         if len(candidate_digests) != 1:
             raise PromotionError("comparisons do not evaluate the same candidate Skill")
+        previous_digests = {
+            item["conditions"]["previous"]["skill_digest"] for item in comparisons
+        }
+        if len(previous_digests) != 1:
+            raise PromotionError("comparisons do not evaluate the same previous Skill")
+        policy_v2 = policy["schema"] == "workloop-promotion-policy/2"
+        if policy_v2 and args.search_ledger is None:
+            raise PromotionError("v2 promotion requires --search-ledger")
+        try:
+            search_ledger = (
+                validate_search_ledger(args.search_ledger, require_closed=True)
+                if args.search_ledger is not None
+                else None
+            )
+        except SearchLedgerError as exc:
+            raise PromotionError(f"invalid search ledger: {exc}") from exc
+        proposal_bindings = (
+            [normalized_proposal_binding(item) for item in comparisons]
+            if policy_v2
+            else []
+        )
     except PromotionError as exc:
         print(f"decide-promotion: {exc}", file=sys.stderr)
         return 2
@@ -242,6 +503,292 @@ def main() -> int:
                 "actual": observed_classes,
                 "required": policy["required_evidence_classes"],
             }
+        )
+
+    selected_proposal_binding: dict[str, Any] | None = None
+    class_counts = Counter(
+        item["compatible_envelope"]["dataset"]["evidence_class"] for item in comparisons
+    )
+    if policy_v2:
+        available_bindings = [item for item in proposal_bindings if item is not None]
+        if len(available_bindings) != len(comparisons):
+            checks.append(
+                {
+                    "gate": "proposal_validation_binding",
+                    "status": "inconclusive",
+                    "actual": len(available_bindings),
+                    "required": len(comparisons),
+                }
+            )
+        else:
+            binding_digests = {
+                canonical_json_digest(item) for item in available_bindings
+            }
+            if len(binding_digests) != 1:
+                checks.append(
+                    {
+                        "gate": "proposal_validation_binding",
+                        "status": "failed",
+                        "actual": sorted(binding_digests),
+                        "required": "one frozen proposal binding",
+                    }
+                )
+            else:
+                selected_proposal_binding = available_bindings[0]
+                checks.append(
+                    {
+                        "gate": "proposal_validation_binding",
+                        "status": "passed",
+                        "actual": selected_proposal_binding["digest"],
+                        "required": "one frozen proposal binding",
+                    }
+                )
+        duplicate_classes = {
+            name: count for name, count in class_counts.items() if count != 1
+        }
+        checks.append(
+            {
+                "gate": "unique_comparison_per_evidence_class",
+                "status": "failed" if duplicate_classes else "passed",
+                "actual": dict(sorted(class_counts.items())),
+                "threshold": 1,
+                "operator": "==",
+            }
+        )
+        assert search_ledger is not None
+        ledger_comparison_digests = {
+            item["digest"] for item in search_ledger["comparisons"]
+        }
+        supplied_comparison_digests = {item["digest"] for item in comparisons}
+        selected_ledger_candidate = search_ledger.get("selected_candidate")
+        ledger_binding_passed = (
+            search_ledger.get("base_skill_digest") in previous_digests
+            and isinstance(selected_ledger_candidate, dict)
+            and selected_ledger_candidate.get("candidate_skill_digest")
+            in candidate_digests
+            and selected_proposal_binding is not None
+            and selected_ledger_candidate.get("proposal_validation_digest")
+            == selected_proposal_binding.get("digest")
+            and selected_ledger_candidate.get("proposal_digest")
+            == selected_proposal_binding.get("proposal_digest")
+            and supplied_comparison_digests.issubset(ledger_comparison_digests)
+        )
+        checks.append(
+            {
+                "gate": "search_ledger_binding",
+                "status": "passed" if ledger_binding_passed else "failed",
+                "actual": {
+                    "base_skill_digest": search_ledger.get("base_skill_digest"),
+                    "selected_candidate_skill_digest": (
+                        selected_ledger_candidate.get("candidate_skill_digest")
+                        if isinstance(selected_ledger_candidate, dict)
+                        else None
+                    ),
+                    "recorded_final_comparisons": len(
+                        supplied_comparison_digests & ledger_comparison_digests
+                    ),
+                },
+                "required": {
+                    "previous_skill_digest": next(iter(previous_digests)),
+                    "candidate_skill_digest": next(iter(candidate_digests)),
+                    "final_comparisons": len(supplied_comparison_digests),
+                },
+            }
+        )
+        ledger_class_counts = search_ledger["evidence_class_counts"]
+        append_threshold_check(
+            checks,
+            gate="max_held_out_comparisons",
+            actual=ledger_class_counts.get("held-out", 0),
+            threshold=policy["max_held_out_comparisons"],
+            operator="<=",
+        )
+        append_threshold_check(
+            checks,
+            gate="max_audit_held_out_comparisons",
+            actual=ledger_class_counts.get("audit-held-out", 0),
+            threshold=policy["max_audit_held_out_comparisons"],
+            operator="<=",
+        )
+        search = (
+            selected_proposal_binding.get("search", {})
+            if selected_proposal_binding
+            else {}
+        )
+        append_threshold_check(
+            checks,
+            gate="max_candidates_considered",
+            actual=search_ledger.get("candidate_count"),
+            threshold=policy["max_candidates_considered"],
+            operator="<=",
+        )
+        append_threshold_check(
+            checks,
+            gate="declared_candidates_considered",
+            actual=search.get("candidates_considered"),
+            threshold=search_ledger.get("candidate_count"),
+            operator="==",
+        )
+        append_threshold_check(
+            checks,
+            gate="max_search_rounds",
+            actual=search_ledger.get("max_round"),
+            threshold=policy["max_search_rounds"],
+            operator="<=",
+        )
+        append_threshold_check(
+            checks,
+            gate="selected_candidate_round",
+            actual=search.get("round"),
+            threshold=(
+                selected_ledger_candidate.get("round")
+                if isinstance(selected_ledger_candidate, dict)
+                else None
+            ),
+            operator="==",
+        )
+        append_threshold_check(
+            checks,
+            gate="held_out_evaluations_before_freeze",
+            actual=search.get("held_out_evaluations_before_freeze"),
+            threshold=0,
+            operator="<=",
+        )
+        append_threshold_check(
+            checks,
+            gate="audit_held_out_evaluations_before_freeze",
+            actual=search.get("audit_held_out_evaluations_before_freeze"),
+            threshold=0,
+            operator="<=",
+        )
+        budgets = (
+            selected_proposal_binding.get("budgets", {})
+            if selected_proposal_binding
+            else {}
+        )
+        ledger_resources = search_ledger["resources"]
+        append_threshold_check(
+            checks,
+            gate="proposal_max_trials",
+            actual=ledger_resources.get("trials"),
+            threshold=budgets.get("max_trials"),
+            operator="<=",
+        )
+        append_threshold_check(
+            checks,
+            gate="proposal_max_cost_usd",
+            actual=ledger_resources.get("cost_usd"),
+            threshold=budgets.get("max_cost_usd"),
+            operator="<=",
+        )
+        append_threshold_check(
+            checks,
+            gate="proposal_max_duration_seconds",
+            actual=ledger_resources.get("duration_seconds"),
+            threshold=budgets.get("max_duration_seconds"),
+            operator="<=",
+        )
+        identities = observed_identity_summary(comparisons)
+        identity_incomplete = (
+            identities["producer_records"] == 0
+            or identities["grader_records"] == 0
+            or identities["producer_missing"] > 0
+            or identities["grader_missing"] > 0
+            or identities["grader_binding_missing"] > 0
+        )
+        identity_drift = (
+            len(identities["producer_models"]) != 1
+            or len(identities["grader_models"]) != 1
+            or len(identities["grader_bindings"]) != 1
+        )
+        checks.append(
+            {
+                "gate": "observed_model_identity",
+                "status": (
+                    "inconclusive"
+                    if identity_incomplete
+                    else "failed"
+                    if identity_drift
+                    else "passed"
+                ),
+                "actual": identities,
+                "required": (
+                    "complete, stable provider-observed producer and grader "
+                    "identities with one frozen grader binding"
+                ),
+            }
+        )
+        identities_missing = (
+            identities["producer_records"] == 0
+            or identities["grader_records"] == 0
+            or identities["producer_missing"] > 0
+            or identities["grader_missing"] > 0
+        )
+        identity_overlap = sorted(
+            set(identities["producer_models"]) & set(identities["grader_models"])
+        )
+        checks.append(
+            {
+                "gate": "distinct_grader_observed_model",
+                "status": (
+                    "inconclusive"
+                    if identities_missing
+                    else "failed"
+                    if identity_overlap
+                    else "passed"
+                ),
+                "actual": {
+                    "producer_models": identities["producer_models"],
+                    "grader_models": identities["grader_models"],
+                    "overlap": identity_overlap,
+                },
+                "required": "no overlap between observed producer and grader models",
+            }
+        )
+        improvement_class = policy["required_improvement_evidence_class"]
+        improvement = [
+            item
+            for item in comparisons
+            if item["compatible_envelope"]["dataset"]["evidence_class"]
+            == improvement_class
+        ]
+        improvement_delta = (
+            improvement[0]["deltas"]["candidate_vs_previous"]
+            if len(improvement) == 1
+            else {}
+        )
+        paired = improvement_delta.get("paired_trials", {})
+        confidence = paired.get("candidate_win_rate_wilson_95")
+        confidence_lower = (
+            confidence[0]
+            if isinstance(confidence, list)
+            and len(confidence) == 2
+            and finite_metric(confidence[0]) is not None
+            else None
+        )
+        append_threshold_check(
+            checks,
+            gate="min_improvement_pass_rate_delta",
+            actual=improvement_delta.get("pass_rate"),
+            threshold=policy["min_improvement_pass_rate_delta"],
+            operator=">=",
+            evidence_class=improvement_class,
+        )
+        append_threshold_check(
+            checks,
+            gate="min_improvement_paired_net_wins",
+            actual=paired.get("candidate_net_wins"),
+            threshold=policy["min_improvement_paired_net_wins"],
+            operator=">=",
+            evidence_class=improvement_class,
+        )
+        append_threshold_check(
+            checks,
+            gate="min_improvement_paired_win_rate_lower_95",
+            actual=confidence_lower,
+            threshold=policy["min_improvement_paired_win_rate_lower_95"],
+            operator=">=",
+            evidence_class=improvement_class,
         )
 
     for comparison in comparisons:
@@ -366,11 +913,36 @@ def main() -> int:
         status = "eligible_for_human_approval"
         exit_code = 0
     decision = {
-        "schema": "workloop-promotion-decision/1",
+        "schema": (
+            "workloop-promotion-decision/2"
+            if policy_v2
+            else "workloop-promotion-decision/1"
+        ),
         "status": status,
         "promotion_authorized": False,
         "human_approval_required": True,
         "candidate_skill_digest": next(iter(candidate_digests)),
+        "previous_skill_digest": next(iter(previous_digests)),
+        "proposal_validation": selected_proposal_binding,
+        "search_ledger": (
+            {
+                key: search_ledger[key]
+                for key in (
+                    "path",
+                    "file_digest",
+                    "head_digest",
+                    "search_id",
+                    "base_skill_digest",
+                    "candidate_count",
+                    "max_round",
+                    "evidence_class_counts",
+                    "resources",
+                    "selected_candidate",
+                )
+            }
+            if search_ledger is not None
+            else None
+        ),
         "observed_evidence_classes": observed_classes,
         "missing_evidence_classes": missing_classes,
         "policy": {

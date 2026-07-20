@@ -1,0 +1,18 @@
+{
+  "name": "adaptive-workloop",
+  "version": "0.6.0",
+  "description": "Risk-based process router for AI coding agents. Decides how much planning, verification, review, and coordination a task deserves, then runs the smallest loop that can prove completion.",
+  "author": {
+    "name": "Leo Wang"
+  },
+  "keywords": [
+    "workflow",
+    "process-router",
+    "verification",
+    "code-review",
+    "orchestration",
+    "tdd",
+    "agent-skills"
+  ],
+  "license": "MIT"
+}

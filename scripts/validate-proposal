@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""Validate a bounded Harness-improvement proposal against actual Skill changes."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import sys
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+sys.dont_write_bytecode = True
+from workloop_core import (  # noqa: E402
+    atomic_write_text,
+    canonical_json_digest,
+    file_digest,
+    skill_runtime_digest,
+    skill_runtime_file_digests,
+)
+
+
+PROPOSAL_SCHEMA = "workloop-improvement-proposal/2"
+REGISTRY_SCHEMA = "workloop-editable-surfaces/1"
+VALIDATION_SCHEMA = "workloop-proposal-validation/1"
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+CRITICALITIES = {
+    "root_cause",
+    "contributor",
+    "unknown",
+    "non_terminal_friction",
+    "recovered_friction",
+}
+RISKS = {"low", "medium", "high"}
+
+
+class ProposalError(ValueError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--proposal", type=Path)
+    parser.add_argument("--registry", required=True, type=Path)
+    parser.add_argument("--previous-skill", type=Path)
+    parser.add_argument("--candidate-skill", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--validate-registry", action="store_true")
+    return parser.parse_args()
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ProposalError(f"{path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ProposalError(f"{path}: root must be an object")
+    return value
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    atomic_write_text(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def exact_fields(value: dict[str, Any], expected: set[str], label: str) -> None:
+    if set(value) != expected:
+        missing = sorted(expected - set(value))
+        extra = sorted(set(value) - expected)
+        raise ProposalError(
+            f"{label} fields mismatch: missing={missing}, extra={extra}"
+        )
+
+
+def identifier(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not ID_RE.fullmatch(value):
+        raise ProposalError(f"{label} must be a lowercase stable identifier")
+    return value
+
+
+def nonempty_text(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise ProposalError(f"{label} must be non-empty text")
+    return value.strip()
+
+
+def string_list(value: Any, label: str, *, required: bool = True) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or (required and not value)
+        or any(not isinstance(item, str) or not item.strip() for item in value)
+    ):
+        raise ProposalError(f"{label} must be a list of non-empty strings")
+    normalized = [item.strip() for item in value]
+    if len(normalized) != len(set(normalized)):
+        raise ProposalError(f"{label} must not contain duplicates")
+    return normalized
+
+
+def digest(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not DIGEST_RE.fullmatch(value):
+        raise ProposalError(f"{label} must be a sha256 digest")
+    return value
+
+
+def relative_path(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ProposalError(f"{label} must be a relative path")
+    path = PurePosixPath(value)
+    if path.is_absolute() or ".." in path.parts or value != path.as_posix():
+        raise ProposalError(f"{label} must be a normalized relative path")
+    return value
+
+
+def path_matches(path: str, allowed: str) -> bool:
+    return path == allowed or path.startswith(allowed.rstrip("/") + "/")
+
+
+def positive_number(value: Any, label: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ProposalError(f"{label} must be a positive finite number")
+    return float(value)
+
+
+def positive_integer(value: Any, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ProposalError(f"{label} must be a positive integer")
+    return value
+
+
+def nonnegative_integer(value: Any, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ProposalError(f"{label} must be a non-negative integer")
+    return value
+
+
+def validate_registry(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    exact_fields(
+        value,
+        {"schema", "max_surfaces_per_proposal", "protected_paths", "surfaces"},
+        "registry",
+    )
+    if value.get("schema") != REGISTRY_SCHEMA:
+        raise ProposalError(f"registry schema must be {REGISTRY_SCHEMA}")
+    maximum = positive_integer(
+        value.get("max_surfaces_per_proposal"), "max_surfaces_per_proposal"
+    )
+    if maximum != 1:
+        raise ProposalError("registry must keep max_surfaces_per_proposal at 1")
+    protected = string_list(value.get("protected_paths"), "protected_paths")
+    protected = [relative_path(item, "protected path") for item in protected]
+    surfaces = value.get("surfaces")
+    if not isinstance(surfaces, list) or not surfaces:
+        raise ProposalError("registry surfaces must be a non-empty list")
+    by_id: dict[str, dict[str, Any]] = {}
+    for index, surface in enumerate(surfaces):
+        if not isinstance(surface, dict):
+            raise ProposalError(f"surface {index} must be an object")
+        exact_fields(
+            surface,
+            {
+                "id",
+                "paths",
+                "hooks",
+                "mechanism_families",
+                "risk",
+                "review_required",
+                "validators",
+            },
+            f"surface {index}",
+        )
+        surface_id = identifier(surface.get("id"), f"surface {index} id")
+        if surface_id in by_id:
+            raise ProposalError(f"duplicate surface id: {surface_id}")
+        paths = [
+            relative_path(item, f"surface {surface_id} path")
+            for item in string_list(surface.get("paths"), f"surface {surface_id} paths")
+        ]
+        if any(
+            path_matches(path, protected_path) or path_matches(protected_path, path)
+            for path in paths
+            for protected_path in protected
+        ):
+            raise ProposalError(f"surface {surface_id} overlaps a protected path")
+        hooks = string_list(surface.get("hooks"), f"surface {surface_id} hooks")
+        for hook in hooks:
+            identifier(hook, f"surface {surface_id} hook")
+        mechanisms = string_list(
+            surface.get("mechanism_families"),
+            f"surface {surface_id} mechanism_families",
+        )
+        for mechanism in mechanisms:
+            identifier(mechanism, f"surface {surface_id} mechanism")
+        if surface.get("risk") not in RISKS:
+            raise ProposalError(f"surface {surface_id} risk is invalid")
+        if surface.get("review_required") is not True:
+            raise ProposalError(f"surface {surface_id} must require review")
+        validators = surface.get("validators")
+        if (
+            not isinstance(validators, list)
+            or not validators
+            or any(
+                not isinstance(argv, list)
+                or not argv
+                or any(not isinstance(item, str) or not item for item in argv)
+                for argv in validators
+            )
+        ):
+            raise ProposalError(f"surface {surface_id} validators are invalid")
+        by_id[surface_id] = surface
+    value["_protected_paths"] = protected
+    return by_id
+
+
+def validate_proposal_shape(value: dict[str, Any]) -> None:
+    exact_fields(
+        value,
+        {
+            "schema",
+            "proposal_id",
+            "decision",
+            "created_at",
+            "base_skill_digest",
+            "candidate_skill_digest",
+            "failure_signature",
+            "change",
+            "search",
+            "budgets",
+            "changed_paths",
+            "digest",
+        },
+        "proposal",
+    )
+    if value.get("schema") != PROPOSAL_SCHEMA:
+        raise ProposalError(f"proposal schema must be {PROPOSAL_SCHEMA}")
+    if value.get("digest") != canonical_json_digest(value, omit={"digest"}):
+        raise ProposalError("proposal digest mismatch")
+    identifier(value.get("proposal_id"), "proposal_id")
+    if value.get("decision") not in {"evaluate", "decline"}:
+        raise ProposalError("decision must be evaluate or decline")
+    created_at = nonempty_text(value.get("created_at"), "created_at")
+    try:
+        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ProposalError("created_at must be ISO-8601") from exc
+    if parsed.tzinfo is None:
+        raise ProposalError("created_at must include a timezone")
+    digest(value.get("base_skill_digest"), "base_skill_digest")
+    digest(value.get("candidate_skill_digest"), "candidate_skill_digest")
+
+    failure = value.get("failure_signature")
+    if not isinstance(failure, dict):
+        raise ProposalError("failure_signature must be an object")
+    exact_fields(
+        failure,
+        {
+            "terminal_cause",
+            "criticality",
+            "agent_mechanism",
+            "evidence_case_ids",
+            "evidence_artifact_digests",
+        },
+        "failure_signature",
+    )
+    identifier(failure.get("terminal_cause"), "terminal_cause")
+    identifier(failure.get("agent_mechanism"), "agent_mechanism")
+    if failure.get("criticality") not in CRITICALITIES:
+        raise ProposalError("failure_signature criticality is invalid")
+    string_list(failure.get("evidence_case_ids"), "evidence_case_ids")
+    evidence_digests = string_list(
+        failure.get("evidence_artifact_digests"), "evidence_artifact_digests"
+    )
+    for item in evidence_digests:
+        digest(item, "evidence artifact digest")
+
+    search = value.get("search")
+    if not isinstance(search, dict):
+        raise ProposalError("search must be an object")
+    exact_fields(
+        search,
+        {
+            "round",
+            "candidate_index",
+            "candidates_considered",
+            "held_out_evaluations_before_freeze",
+            "audit_held_out_evaluations_before_freeze",
+        },
+        "search",
+    )
+    round_index = positive_integer(search.get("round"), "search.round")
+    candidate_index = positive_integer(
+        search.get("candidate_index"), "search.candidate_index"
+    )
+    considered = positive_integer(
+        search.get("candidates_considered"), "search.candidates_considered"
+    )
+    if candidate_index > considered:
+        raise ProposalError("candidate_index exceeds candidates_considered")
+    if round_index < 1:
+        raise ProposalError("search.round is invalid")
+    held_out_seen = nonnegative_integer(
+        search.get("held_out_evaluations_before_freeze"),
+        "held_out_evaluations_before_freeze",
+    )
+    audit_seen = nonnegative_integer(
+        search.get("audit_held_out_evaluations_before_freeze"),
+        "audit_held_out_evaluations_before_freeze",
+    )
+    if held_out_seen or audit_seen:
+        raise ProposalError("proposal must freeze before any held-out evaluation")
+
+    budgets = value.get("budgets")
+    if not isinstance(budgets, dict):
+        raise ProposalError("budgets must be an object")
+    exact_fields(
+        budgets,
+        {"max_trials", "max_cost_usd", "max_duration_seconds"},
+        "budgets",
+    )
+    positive_integer(budgets.get("max_trials"), "budgets.max_trials")
+    positive_number(budgets.get("max_cost_usd"), "budgets.max_cost_usd")
+    positive_number(budgets.get("max_duration_seconds"), "budgets.max_duration_seconds")
+    paths = string_list(value.get("changed_paths"), "changed_paths", required=False)
+    for path in paths:
+        relative_path(path, "changed path")
+
+
+def changed_runtime_paths(previous: Path, candidate: Path) -> list[str]:
+    before = skill_runtime_file_digests(previous)
+    after = skill_runtime_file_digests(candidate)
+    return sorted(
+        path for path in set(before) | set(after) if before.get(path) != after.get(path)
+    )
+
+
+def validate_change(
+    proposal: dict[str, Any],
+    registry: dict[str, Any],
+    surfaces: dict[str, dict[str, Any]],
+    actual_paths: list[str],
+) -> tuple[str | None, list[list[str]]]:
+    change = proposal.get("change")
+    if not isinstance(change, dict):
+        raise ProposalError("change must be an object")
+    exact_fields(
+        change,
+        {
+            "mechanism_family",
+            "surface_id",
+            "exact_hook",
+            "summary",
+            "candidate_values",
+            "expected_affected_cases",
+            "protected_passing_cases",
+            "regression_guard",
+            "why_not_noop",
+            "decline_reason",
+        },
+        "change",
+    )
+    decision = proposal["decision"]
+    if decision == "decline":
+        if (
+            actual_paths
+            or proposal["base_skill_digest"] != proposal["candidate_skill_digest"]
+        ):
+            raise ProposalError("declined proposals cannot change the Skill")
+        if change.get("candidate_values") not in ({}, None):
+            raise ProposalError("declined proposals cannot contain candidate_values")
+        nonempty_text(change.get("decline_reason"), "decline_reason")
+        return None, []
+
+    surface_id = identifier(change.get("surface_id"), "change.surface_id")
+    surface = surfaces.get(surface_id)
+    if surface is None:
+        raise ProposalError(f"unknown editable surface: {surface_id}")
+    mechanism = identifier(change.get("mechanism_family"), "change.mechanism_family")
+    if mechanism not in surface["mechanism_families"]:
+        raise ProposalError("mechanism_family is not allowed for the selected surface")
+    hook = identifier(change.get("exact_hook"), "change.exact_hook")
+    if hook not in surface["hooks"]:
+        raise ProposalError("exact_hook is not allowed for the selected surface")
+    candidate_values = change.get("candidate_values")
+    if not isinstance(candidate_values, dict) or set(candidate_values) != {hook}:
+        raise ProposalError("candidate_values must contain exactly the selected hook")
+    nonempty_text(change.get("summary"), "change.summary")
+    string_list(change.get("expected_affected_cases"), "change.expected_affected_cases")
+    string_list(change.get("protected_passing_cases"), "change.protected_passing_cases")
+    nonempty_text(change.get("regression_guard"), "change.regression_guard")
+    nonempty_text(change.get("why_not_noop"), "change.why_not_noop")
+    if change.get("decline_reason") is not None:
+        raise ProposalError("evaluated proposals must set decline_reason to null")
+    protected = registry["_protected_paths"]
+    protected_changes = [
+        path
+        for path in actual_paths
+        if any(path_matches(path, item) for item in protected)
+    ]
+    if protected_changes:
+        raise ProposalError(f"proposal changes protected paths: {protected_changes}")
+    disallowed = [
+        path
+        for path in actual_paths
+        if not any(path_matches(path, allowed) for allowed in surface["paths"])
+    ]
+    if disallowed:
+        raise ProposalError(
+            f"proposal changes paths outside surface {surface_id}: {disallowed}"
+        )
+    if not actual_paths:
+        raise ProposalError("evaluated proposal is a no-op")
+    return surface_id, surface["validators"]
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        registry_path = args.registry.expanduser().resolve()
+        registry = load_json(registry_path)
+        surfaces = validate_registry(registry)
+        if args.validate_registry:
+            if any(
+                value is not None
+                for value in (
+                    args.proposal,
+                    args.previous_skill,
+                    args.candidate_skill,
+                    args.output,
+                )
+            ):
+                raise ProposalError(
+                    "--validate-registry cannot be combined with proposal arguments"
+                )
+            print(f"validate-proposal: registry PASS ({len(surfaces)} surfaces)")
+            return 0
+        if not all(
+            value is not None
+            for value in (
+                args.proposal,
+                args.previous_skill,
+                args.candidate_skill,
+                args.output,
+            )
+        ):
+            raise ProposalError(
+                "proposal validation requires --proposal, --previous-skill, "
+                "--candidate-skill, and --output"
+            )
+        proposal_path = args.proposal.expanduser().resolve()
+        previous = args.previous_skill.expanduser().resolve()
+        candidate = args.candidate_skill.expanduser().resolve()
+        output = args.output.expanduser().resolve()
+        if output.exists():
+            raise ProposalError(f"output already exists: {output}")
+        if (
+            not (previous / "SKILL.md").is_file()
+            or not (candidate / "SKILL.md").is_file()
+        ):
+            raise ProposalError("previous and candidate must be Skill checkouts")
+        proposal = load_json(proposal_path)
+        validate_proposal_shape(proposal)
+        previous_digest = skill_runtime_digest(previous)
+        candidate_digest = skill_runtime_digest(candidate)
+        if proposal["base_skill_digest"] != previous_digest:
+            raise ProposalError(
+                "proposal base_skill_digest does not match previous Skill"
+            )
+        if proposal["candidate_skill_digest"] != candidate_digest:
+            raise ProposalError(
+                "proposal candidate_skill_digest does not match candidate Skill"
+            )
+        actual_paths = changed_runtime_paths(previous, candidate)
+        protected_changes = [
+            path
+            for path in actual_paths
+            if any(path_matches(path, item) for item in registry["_protected_paths"])
+        ]
+        if protected_changes:
+            raise ProposalError(
+                f"proposal changes protected paths: {protected_changes}"
+            )
+        if proposal["changed_paths"] != actual_paths:
+            raise ProposalError(
+                "proposal changed_paths do not match actual runtime changes: "
+                f"declared={proposal['changed_paths']}, actual={actual_paths}"
+            )
+        surface_id, validators = validate_change(
+            proposal, registry, surfaces, actual_paths
+        )
+        validation = {
+            "schema": VALIDATION_SCHEMA,
+            "status": "declined" if proposal["decision"] == "decline" else "validated",
+            "promotion_authorized": False,
+            "validator": {
+                "path": str(Path(__file__).resolve()),
+                "digest": file_digest(Path(__file__).resolve()),
+            },
+            "proposal": {
+                "path": str(proposal_path),
+                "file_digest": file_digest(proposal_path),
+                "digest": proposal["digest"],
+            },
+            "registry": {
+                "path": str(registry_path),
+                "file_digest": file_digest(registry_path),
+            },
+            "base_skill_digest": previous_digest,
+            "candidate_skill_digest": candidate_digest,
+            "surface_id": surface_id,
+            "actual_changed_paths": actual_paths,
+            "validators": validators,
+            "search": proposal["search"],
+            "budgets": proposal["budgets"],
+        }
+        validation["digest"] = canonical_json_digest(validation)
+        write_json(output, validation)
+    except ProposalError as exc:
+        print(f"validate-proposal: {exc}", file=sys.stderr)
+        return 2
+    print(f"validate-proposal: validated: {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
