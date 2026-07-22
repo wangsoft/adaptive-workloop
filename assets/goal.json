@@ -1,0 +1,27 @@
+{
+  "schema": "workloop-goal/1",
+  "status": "needs_user",
+  "profile": "engineering",
+  "outcome": "",
+  "success_criteria": [],
+  "scope": {
+    "in": [],
+    "non_goals": []
+  },
+  "constraints": [],
+  "risks": [],
+  "unknowns": [
+    {
+      "id": "goal-clarity",
+      "question": "What observable evidence proves this outcome is complete?",
+      "blocking": true,
+      "assumption": null,
+      "evidence_needed": "User-confirmed success criteria"
+    }
+  ],
+  "authority": {
+    "decision_owner": "user",
+    "allowed_actions": ["workspace-local"],
+    "approval_required": []
+  }
+}

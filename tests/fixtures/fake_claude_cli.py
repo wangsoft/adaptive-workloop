@@ -25,6 +25,8 @@ prompt = sys.stdin.read()
 assert "expected" not in prompt.lower()
 artifact = workspace / "review.md"
 artifact.write_text("# Independent review required\n", encoding="utf-8")
+for name in ("goal.json", "plan.json"):
+    (workspace / name).write_text(f'{{"fixture": "{name}"}}\n', encoding="utf-8")
 print(
     json.dumps(
         {
@@ -53,7 +55,7 @@ print(
                 "terminal": "needs_human",
                 "degradation": "labeled-self-review",
                 "transcript": "fixture Claude stopped at the human boundary",
-                "artifact_paths": ["review.md"],
+                "artifact_paths": ["goal.json", "plan.json", "review.md"],
             },
             "usage": {
                 "input_tokens": 13,

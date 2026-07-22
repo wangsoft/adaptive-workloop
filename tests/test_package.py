@@ -95,6 +95,26 @@ class RoutingContractTests(unittest.TestCase):
         self.assertFalse(by_id["t-001"]["should_trigger"])
         self.assertGreaterEqual(len(negatives), 8)
 
+    def test_bounded_verified_cases_do_not_conflict_with_direct_route(self) -> None:
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("Keep process proportional to task risk", skill)
+
+        for suite_name, case_id in (
+            ("behavior-cases.json", "bc-014"),
+            ("regression-cases.json", "rc-011"),
+        ):
+            suite = json.loads((ROOT / "evals" / suite_name).read_text())
+            case = next(item for item in suite["cases"] if item["id"] == case_id)
+            setup = case["setup"]
+            self.assertTrue(setup["explicit_invocation"])
+            self.assertGreater(setup["affected_files"], 3)
+
+            expected = " ".join(
+                case["expected"].get("must", []) + case["expected"].get("must_not", [])
+            )
+            self.assertNotIn("few lines", expected)
+            self.assertNotIn("stays proportional", expected)
+
     def test_outer_loop_authority_and_multi_agent_cost_gate_are_explicit(self) -> None:
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         routes = (ROOT / "references" / "routes.md").read_text(encoding="utf-8")
@@ -2696,7 +2716,7 @@ class ProviderAdapterTests(unittest.TestCase):
                 response["runtime"]["observed_model"], "gpt-fixture-observed"
             )
             self.assertEqual(response["trace"]["skill_calls"], ["adaptive-workloop"])
-            self.assertEqual(len(grading["verified_artifacts"]), 1)
+            self.assertEqual(len(grading["verified_artifacts"]), 3)
             self.assertRegex(
                 grading["verified_artifacts"][0]["sha256"],
                 r"^sha256:[0-9a-f]{64}$",

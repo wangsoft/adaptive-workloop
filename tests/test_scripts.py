@@ -19,7 +19,92 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from workloop_core import skill_runtime_digest  # noqa: E402
 
 
-def fill_episode_documents(episode: Path) -> None:
+def fill_goal_plan(episode: Path, *, check_id: str = "truth") -> None:
+    manifest = json.loads((episode / "manifest.json").read_text())
+    route = manifest["route"]
+    goal = {
+        "schema": "workloop-goal/1",
+        "status": "clear",
+        "profile": "engineering",
+        "outcome": "Produce a locally verifiable result for the test fixture.",
+        "success_criteria": [
+            {"id": "outcome", "description": "The fixture result passes its check."}
+        ],
+        "scope": {"in": ["the bounded fixture"], "non_goals": ["external effects"]},
+        "constraints": ["Keep the fixture deterministic and local."],
+        "risks": [],
+        "unknowns": [],
+        "authority": {
+            "decision_owner": "test-owner",
+            "allowed_actions": ["workspace-local"],
+            "approval_required": [],
+        },
+    }
+    topology = {
+        "verified": "single_agent",
+        "reviewed": "producer_reviewer",
+        "distributed": "coordinator_workers",
+    }[route]
+    steps = [
+        {
+            "id": "deliver",
+            "description": "Produce the fixture result.",
+            "deliverable": "A local fixture artifact.",
+            "owner_role": "builder",
+            "depends_on": [],
+            "goal_criteria": ["outcome"],
+            "check_ids": [check_id],
+            "write_scope": ["fixture/"],
+            "capabilities": ["workspace-write"],
+            "effect": "workspace-local",
+            "approval": {
+                "required": False,
+                "status": "not-required",
+                "owner": "test-owner",
+            },
+            "rollback": "Delete the temporary fixture.",
+        }
+    ]
+    if route == "distributed":
+        steps.append(
+            {
+                **steps[0],
+                "id": "document",
+                "description": "Document the fixture result.",
+                "deliverable": "A local fixture note.",
+                "owner_role": "documenter",
+                "goal_criteria": [],
+                "write_scope": ["notes/"],
+            }
+        )
+    plan = {
+        "schema": "workloop-plan/1",
+        "status": "ready",
+        "route": route,
+        "topology": topology,
+        "coordinator_role": "coordinator",
+        "verification_owner_role": "verifier" if route != "verified" else "builder",
+        "max_agent_depth": 1,
+        "verification_dimensions": [
+            "diff-scope",
+            "runtime-or-artifact",
+            "static-analysis",
+            "tests",
+        ],
+        "steps": steps,
+        "budget": {"wall_clock_minutes": 5, "retry_limit": 1},
+        "stop_conditions": ["Stop when the local check fails."],
+        "fallback": {
+            "mode": "durable_serial",
+            "trigger": "Use when workers are unavailable.",
+        },
+    }
+    (episode / "goal.json").write_text(json.dumps(goal, indent=2) + "\n")
+    (episode / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+
+
+def fill_episode_documents(episode: Path, *, check_id: str = "truth") -> None:
+    fill_goal_plan(episode, check_id=check_id)
     (episode / "contract.md").write_text(
         """# Contract — test episode
 
@@ -172,8 +257,11 @@ class CreateEpisodeTests(unittest.TestCase):
             state = json.loads((episode / "state.json").read_text())
             checks = json.loads((episode / "checks.json").read_text())
 
-            self.assertEqual(manifest["schema"], "workloop-episode/2")
+            self.assertEqual(manifest["schema"], "workloop-episode/3")
             self.assertEqual(manifest["repo"]["root"], ".")
+            self.assertEqual(
+                manifest["workspace"], {"kind": "artifact-root", "root": "."}
+            )
             self.assertEqual(manifest["storage"], "local")
             self.assertEqual(manifest["model"]["id"], "test-model")
             self.assertNotIn("status", manifest)
@@ -182,6 +270,12 @@ class CreateEpisodeTests(unittest.TestCase):
             self.assertEqual(checks["schema"], "workloop-checks/1")
             self.assertEqual(checks["checks"], [])
             self.assertEqual(checks["manual"], [])
+            self.assertEqual(
+                json.loads((episode / "goal.json").read_text())["status"],
+                "needs_user",
+            )
+            self.assertTrue((episode / "plan.json").is_file())
+            self.assertTrue((episode / "learning-candidates.jsonl").is_file())
             self.assertTrue((episode / "events.jsonl").is_file())
             first_event = json.loads(
                 (episode / "events.jsonl").read_text().splitlines()[0]
@@ -319,7 +413,7 @@ class VerifyContractTests(unittest.TestCase):
             )
             self.assertIn("Episode created:", created.stdout)
             episode = next((root / ".workloop" / "local").iterdir())
-            fill_episode_documents(episode)
+            fill_episode_documents(episode, check_id="repo-root")
             (episode / "checks.json").write_text(
                 json.dumps(
                     {
@@ -458,6 +552,7 @@ class VerifyContractTests(unittest.TestCase):
             )
             episode = next((root / ".workloop" / "local").iterdir())
             self.write_placeholder_check(episode)
+            fill_goal_plan(episode)
 
             result = subprocess.run(
                 [str(VERIFY_CONTRACT), str(episode)],
@@ -610,6 +705,8 @@ class EpisodeStateTests(unittest.TestCase):
                 check=True,
             )
             episode = next((root / ".workloop" / "local").iterdir())
+            fill_episode_documents(episode)
+            self.write_passing_checks(episode)
             subprocess.run(
                 [str(EPISODE_STATE), str(episode), "--status", "in_progress"],
                 text=True,
@@ -761,6 +858,8 @@ class EpisodeStateTests(unittest.TestCase):
             )
             episode = next((root / ".workloop" / "tracked").iterdir())
             manifest_before = (episode / "manifest.json").read_bytes()
+            fill_episode_documents(episode)
+            self.write_passing_checks(episode)
 
             result = subprocess.run(
                 [
@@ -809,6 +908,8 @@ class EpisodeStateTests(unittest.TestCase):
                 check=True,
             )
             episode = next((root / ".workloop" / "tracked").iterdir())
+            fill_episode_documents(episode)
+            self.write_passing_checks(episode)
             subprocess.run(
                 [str(EPISODE_STATE), str(episode), "--status", "in_progress"],
                 text=True,

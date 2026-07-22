@@ -1,6 +1,6 @@
 {
   "suite": "adaptive-workloop/trigger",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "how_to_run": "Give each prompt to a fresh agent session in a host with this skill installed alongside its normal skill set. Grade: (1) skill activation equals should_trigger; (2) when expected_route is non-null, the first announced route matches. Near-miss negatives matter as much as positives — over-triggering on Q&A is a failure.",
   "cases": [
     {
@@ -128,6 +128,27 @@
       "should_trigger": false,
       "expected_route": null,
       "notes": "Standalone review should route to a dedicated review skill."
+    },
+    {
+      "id": "t-019",
+      "prompt": "调研三种企业知识库方案，必须引用最新一手资料、给出反例，并形成可执行的选型计划",
+      "should_trigger": true,
+      "expected_route": "reviewed",
+      "notes": "Non-trivial research has a research profile, subjective synthesis, and explicit evidence obligations."
+    },
+    {
+      "id": "t-020",
+      "prompt": "帮我做一个跨三个月的家庭搬迁计划，包含预算、时间表、风险和每周检查点",
+      "should_trigger": true,
+      "expected_route": "distributed",
+      "notes": "Personal planning is in scope because it has a long horizon, durable state, constraints, and checkpoints."
+    },
+    {
+      "id": "t-021",
+      "prompt": "把这句话翻译成英文：目标要清晰",
+      "should_trigger": false,
+      "expected_route": null,
+      "notes": "Translation is a one-step fast-path task."
     }
   ]
 }

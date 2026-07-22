@@ -10,6 +10,7 @@ __pycache__/
 *.p12
 *.pfx
 evals/runs/
+tools/eval-core/runs/
 .workloop/local/
 .workloop/tracked/*/runtime.json
 .workloop/tracked/*/capabilities.json

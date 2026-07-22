@@ -39,4 +39,4 @@ episode: `{{EPISODE_ID}}` · route: **{{ROUTE}}** · path: `{{EPISODE_PATH}}` ·
 
 ## Resume protocol
 
-Resolve the installed `adaptive-workloop` Skill directory. Read `manifest.json` → `state.json` → `events.jsonl` → this file → `contract.md` → `checks.json`. Compare recorded state with `git status` and repository history since `manifest.repo.head`; then run `<skill-dir>/scripts/verify-contract {{EPISODE_PATH}}`. Re-verification beats recorded claims. Update this file and append an event before continuing.
+Resolve the installed `adaptive-workloop` Skill directory. Read `manifest.json` → `state.json` → `events.jsonl` → `goal.json` → `plan.json` → this file → `contract.md` → `checks.json`. Compare recorded state with the current workspace snapshot and any target-system effects; then run `<skill-dir>/scripts/validate-intent-plan {{EPISODE_PATH}}` and `<skill-dir>/scripts/verify-contract {{EPISODE_PATH}}`. Re-verification beats recorded claims. Update this file and append an event before continuing.

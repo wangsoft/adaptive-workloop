@@ -30,6 +30,8 @@
         "terminal": "complete",
         "degradation": "host-native-verified",
         "required_artifacts": [
+          "goal.json",
+          "plan.json",
           "evidence/grading.json"
         ]
       }
@@ -46,6 +48,8 @@
         "terminal": "needs_human",
         "degradation": "labeled-self-review",
         "required_artifacts": [
+          "goal.json",
+          "plan.json",
           "review.md"
         ]
       }
@@ -62,6 +66,8 @@
         "terminal": "complete",
         "degradation": "durable-serial",
         "required_artifacts": [
+          "goal.json",
+          "plan.json",
           "state.json",
           "progress.md"
         ]

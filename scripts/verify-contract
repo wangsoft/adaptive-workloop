@@ -16,7 +16,10 @@ from pathlib import Path
 from typing import Any
 
 sys.dont_write_bytecode = True
-from workloop_core import scan_episode_placeholders  # noqa: E402
+from workloop_core import (  # noqa: E402
+    scan_episode_placeholders,
+    validate_episode_readiness,
+)
 
 
 SCHEMA = "workloop-checks/1"
@@ -328,6 +331,9 @@ def main() -> int:
         checks_path, episode, root = resolve_target(args.target)
         contract = load_contract(checks_path)
         if (episode / "manifest.json").is_file():
+            readiness_errors = validate_episode_readiness(episode)
+            if readiness_errors:
+                raise ContractError("readiness gate: " + "; ".join(readiness_errors))
             placeholders = scan_episode_placeholders(episode)
             if placeholders:
                 first = placeholders[0]
@@ -392,6 +398,13 @@ def main() -> int:
         "results": results,
         "manual": manual,
     }
+    if (episode / "goal.json").is_file() and (episode / "plan.json").is_file():
+        grading["goal_digest"] = (
+            "sha256:" + hashlib.sha256((episode / "goal.json").read_bytes()).hexdigest()
+        )
+        grading["plan_digest"] = (
+            "sha256:" + hashlib.sha256((episode / "plan.json").read_bytes()).hexdigest()
+        )
     write_json(evidence_dir / "grading.json", grading)
     print(
         "summary: "

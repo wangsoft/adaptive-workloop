@@ -1,7 +1,7 @@
 {
   "name": "adaptive-workloop",
-  "version": "0.6.0",
-  "description": "Risk-based process router for AI coding agents. Decides how much planning, verification, review, and coordination a task deserves, then runs the smallest loop that can prove completion.",
+  "version": "0.7.0",
+  "description": "Risk-routed, evidence-gated work orchestrator: process scales to risk, completion is proven with auditable evidence, routing is brand-blind across models, and capability never expands authority — a Goal→Plan→Do→Check→Act loop over four routes.",
   "author": {
     "name": "Leo Wang"
   },
@@ -11,6 +11,7 @@
     "verification",
     "code-review",
     "orchestration",
+    "pdca",
     "tdd",
     "agent-skills"
   ],

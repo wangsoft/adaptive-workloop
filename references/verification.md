@@ -1,6 +1,6 @@
 # Verification
 
-Use the weakest check that can genuinely falsify the change. Route 2+ records executable criteria in `checks.json`; `contract.md` holds intent and scope only.
+Use the weakest check that can genuinely falsify a Goal criterion. Route 2+ maps `goal.json` criteria through `plan.json` steps to executable or manual IDs in `checks.json`; `contract.md` holds explanatory intent and scope only.
 
 ## Verification ladder
 
@@ -45,7 +45,7 @@ Freeform shell strings are invalid. Use argv arrays so task text and Markdown ca
 }
 ```
 
-Check IDs use lowercase letters, digits, and hyphens. `cwd` must remain inside the repository. Close-out is strict: empty criteria, unfilled episode templates, schema errors, failed/timeout checks, common zero-test success output, missing output patterns, or open manual criteria fail.
+Check IDs use lowercase letters, digits, and hyphens. `cwd` must remain inside the selected workspace root. Close-out is strict: an unready Goal/Plan, uncovered Goal criterion, empty criteria, unfilled episode templates, schema errors, failed/timeout checks, common zero-test success output, missing output patterns, or open manual criteria fail.
 
 ## Execution boundary
 
@@ -57,10 +57,10 @@ Check IDs use lowercase letters, digits, and hyphens. `cwd` must remain inside t
 - Prints successful stdout/stderr and stores `evidence/check-<id>.json` plus `evidence/grading.json`.
 - Requires `--allow-risk network` or `--allow-risk external-side-effect` for a declared non-local risk.
 
-`episode-state` is the promotion boundary. Entering `verified` requires
+`episode-state` is the promotion boundary. Entering v3 `in_progress` first validates Goal/Plan and records their current digests with `checks.json`. Entering `verified` requires
 `--kind verification.passed --evidence evidence/grading.json`; it validates the
-grading schema, current checks digest, every automatic result, per-check evidence,
-and manual attestations before recording evidence digests. Entering `complete`
+grading schema, current Goal/Plan/checks digests, every automatic result,
+per-check evidence, and manual attestations before recording evidence digests. Entering `complete`
 requires `episode.closed` and rejects any later grading or evidence drift.
 
 The verifier is not a sandbox. Package scripts and test runners can still execute repository code. Host permissions, isolation, network policy, and action-bound approval remain authoritative. Never hide push, publish, migration, deletion, payment, deploy, send, or other irreversible effects inside a verification check; invoke them directly through the host after approval.

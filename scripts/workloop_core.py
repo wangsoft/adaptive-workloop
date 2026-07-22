@@ -20,7 +20,7 @@ from typing import Any, Iterable, TextIO
 
 SNAPSHOT_SCHEMA = "workloop-repo-snapshot/1"
 EXCLUDED_TOP_LEVEL = {".git", ".workloop"}
-TRACKED_EPISODE_FILES = {
+LEGACY_TRACKED_EPISODE_FILES = {
     "manifest.json",
     "state.json",
     "events.jsonl",
@@ -29,8 +29,14 @@ TRACKED_EPISODE_FILES = {
     "progress.md",
     "handoff.md",
 }
+V3_TRACKED_EPISODE_FILES = LEGACY_TRACKED_EPISODE_FILES | {
+    "goal.json",
+    "plan.json",
+    "learning-candidates.jsonl",
+}
 IGNORED_EPISODE_ENTRIES = {
     ".state.lock",
+    ".learning.lock",
     "runtime.json",
     "capabilities.json",
     "evidence",
@@ -81,6 +87,9 @@ SKILL_RUNTIME_SURFACES = (
     "evals/adapters",
     "evals/profiles",
     "evals/adapter-contract.md",
+    "evals/trace-analysis-contract.md",
+    "evals/trace-analysis-cases.json",
+    "evals/fixtures/trace-analysis",
     "evals/trigger-cases.json",
     "evals/behavior-cases.json",
     "evals/grader-contract.md",
@@ -93,6 +102,30 @@ SKILL_RUNTIME_SURFACES = (
     "evals/promotion-policy.json",
 )
 RELEASE_MANIFEST_SCHEMA = "workloop-release-manifest/1"
+PROFILE_VERIFICATION_DIMENSIONS = {
+    "engineering": {"tests", "static-analysis", "runtime-or-artifact", "diff-scope"},
+    "research": {
+        "freshness",
+        "triangulation",
+        "citation-traceability",
+        "counterevidence",
+    },
+    "writing_design": {"rubric", "factuality", "audience-fit", "rendering-or-review"},
+    "personal_planning": {"constraints", "budget-or-resources", "milestones", "safety"},
+    "high_stakes": {
+        "authoritative-sources",
+        "specialist-review",
+        "approvals",
+        "rollback",
+    },
+}
+GOAL_STATUSES = {"clear", "assumption_bounded", "needs_user"}
+PLAN_TOPOLOGIES = {
+    "single_agent",
+    "producer_reviewer",
+    "coordinator_workers",
+    "durable_serial",
+}
 
 
 class BoundedCommandError(RuntimeError):
@@ -691,19 +724,404 @@ def repository_snapshot(root: Path) -> dict[str, Any]:
     }
 
 
+def _load_json_object(path: Path, errors: list[str]) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"cannot read {path.name}: {exc}")
+        return {}
+    if not isinstance(value, dict):
+        errors.append(f"{path.name} must contain an object")
+        return {}
+    return value
+
+
+def _valid_identifier(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", value) is not None
+    )
+
+
+def _nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _string_list(value: Any, *, nonempty: bool = False) -> bool:
+    return (
+        isinstance(value, list)
+        and (not nonempty or bool(value))
+        and all(_nonempty_string(item) for item in value)
+    )
+
+
+def _scopes_overlap(left: str, right: str) -> bool:
+    left = left.strip().rstrip("/")
+    right = right.strip().rstrip("/")
+    return left == right or left.startswith(right + "/") or right.startswith(left + "/")
+
+
+def validate_episode_readiness(episode: Path) -> list[str]:
+    """Validate Goal and Plan gates for v3 episodes; v2 remains readable."""
+
+    errors: list[str] = []
+    manifest = _load_json_object(episode / "manifest.json", errors)
+    if errors or manifest.get("schema") != "workloop-episode/3":
+        return errors
+
+    goal = _load_json_object(episode / "goal.json", errors)
+    plan = _load_json_object(episode / "plan.json", errors)
+    checks = _load_json_object(episode / "checks.json", errors)
+    if errors:
+        return errors
+
+    if goal.get("schema") != "workloop-goal/1":
+        errors.append("goal.json schema must be workloop-goal/1")
+    status = goal.get("status")
+    if status not in GOAL_STATUSES:
+        errors.append("goal status is invalid")
+    elif status == "needs_user":
+        errors.append("goal status needs_user blocks execution")
+    if not _nonempty_string(goal.get("outcome")):
+        errors.append("goal outcome must be non-empty")
+    profile = goal.get("profile")
+    if profile not in PROFILE_VERIFICATION_DIMENSIONS:
+        errors.append("goal profile is invalid")
+
+    criteria = goal.get("success_criteria")
+    criteria_ids: set[str] = set()
+    if not isinstance(criteria, list) or not criteria:
+        errors.append("goal requires at least one success criterion")
+    else:
+        for index, criterion in enumerate(criteria):
+            if not isinstance(criterion, dict):
+                errors.append(f"success_criteria[{index}] must be an object")
+                continue
+            criterion_id = criterion.get("id")
+            if not _valid_identifier(criterion_id):
+                errors.append(f"success_criteria[{index}].id is invalid")
+            elif criterion_id in criteria_ids:
+                errors.append(f"duplicate success criterion: {criterion_id}")
+            else:
+                criteria_ids.add(criterion_id)
+            if not _nonempty_string(criterion.get("description")):
+                errors.append(f"success_criteria[{index}].description is empty")
+
+    scope = goal.get("scope")
+    if not isinstance(scope, dict) or not _string_list(scope.get("in"), nonempty=True):
+        errors.append("goal scope.in must be a non-empty string array")
+    if not isinstance(scope, dict) or not _string_list(
+        scope.get("non_goals"), nonempty=True
+    ):
+        errors.append("goal scope.non_goals must be a non-empty string array")
+    if not _string_list(goal.get("constraints"), nonempty=True):
+        errors.append("goal constraints must be a non-empty string array")
+    risks = goal.get("risks")
+    if not isinstance(risks, list):
+        errors.append("goal risks must be an array")
+    else:
+        risk_ids: set[str] = set()
+        for index, risk in enumerate(risks):
+            if not isinstance(risk, dict):
+                errors.append(f"risks[{index}] must be an object")
+                continue
+            risk_id = risk.get("id")
+            if not _valid_identifier(risk_id):
+                errors.append(f"risks[{index}].id is invalid")
+            elif risk_id in risk_ids:
+                errors.append(f"duplicate goal risk: {risk_id}")
+            else:
+                risk_ids.add(risk_id)
+            if not _nonempty_string(risk.get("description")):
+                errors.append(f"risks[{index}].description is empty")
+            if not _nonempty_string(risk.get("mitigation")):
+                errors.append(f"risks[{index}].mitigation is empty")
+
+    unknowns = goal.get("unknowns")
+    if not isinstance(unknowns, list):
+        errors.append("goal unknowns must be an array")
+    else:
+        for index, unknown in enumerate(unknowns):
+            if not isinstance(unknown, dict):
+                errors.append(f"unknowns[{index}] must be an object")
+                continue
+            if not _valid_identifier(unknown.get("id")):
+                errors.append(f"unknowns[{index}].id is invalid")
+            if not _nonempty_string(unknown.get("question")):
+                errors.append(f"unknowns[{index}].question is empty")
+            if not isinstance(unknown.get("blocking"), bool):
+                errors.append(f"unknowns[{index}].blocking must be boolean")
+            if unknown.get("blocking") is True:
+                errors.append(
+                    f"blocking goal unknown remains: {unknown.get('id', index)}"
+                )
+            if status == "clear" and unknown.get("resolved") is not True:
+                errors.append(
+                    f"clear goal contains unresolved unknown: {unknown.get('id', index)}"
+                )
+            if status == "assumption_bounded" and not _nonempty_string(
+                unknown.get("assumption")
+            ):
+                errors.append(
+                    f"assumption_bounded unknown lacks assumption: {unknown.get('id', index)}"
+                )
+            if status == "assumption_bounded" and not _nonempty_string(
+                unknown.get("evidence_needed")
+            ):
+                errors.append(
+                    "assumption_bounded unknown lacks evidence_needed: "
+                    f"{unknown.get('id', index)}"
+                )
+    authority = goal.get("authority")
+    allowed_actions: set[str] = set()
+    approval_actions: set[str] = set()
+    if not isinstance(authority, dict):
+        errors.append("goal authority must be an object")
+    else:
+        if not _nonempty_string(authority.get("decision_owner")):
+            errors.append("goal authority.decision_owner is required")
+        if not _string_list(authority.get("allowed_actions"), nonempty=True):
+            errors.append("goal authority.allowed_actions must be non-empty")
+        else:
+            allowed_actions = set(authority["allowed_actions"])
+        if not _string_list(authority.get("approval_required")):
+            errors.append("goal authority.approval_required must be a string array")
+        else:
+            approval_actions = set(authority["approval_required"])
+
+    if plan.get("schema") != "workloop-plan/1":
+        errors.append("plan.json schema must be workloop-plan/1")
+    if plan.get("status") != "ready":
+        errors.append("plan status must be ready")
+    topology = plan.get("topology")
+    if topology not in PLAN_TOPOLOGIES:
+        errors.append("plan topology is invalid")
+    route = plan.get("route")
+    if route not in {"verified", "reviewed", "distributed"}:
+        errors.append("plan route is invalid")
+    if route == "distributed" and manifest.get("storage") != "tracked":
+        errors.append("distributed route requires a tracked episode")
+    verifier = plan.get("verification_owner_role")
+    if not _nonempty_string(plan.get("coordinator_role")):
+        errors.append("plan coordinator_role is required")
+    if not _nonempty_string(verifier):
+        errors.append("plan verification_owner_role is required")
+    depth = plan.get("max_agent_depth")
+    if not isinstance(depth, int) or isinstance(depth, bool) or not 0 <= depth <= 2:
+        errors.append("plan max_agent_depth must be an integer from 0 to 2")
+    if topology == "coordinator_workers" and depth != 1:
+        errors.append("coordinator_workers requires max_agent_depth 1")
+    if route == "reviewed" and topology == "single_agent":
+        errors.append("reviewed route requires a distinct review topology")
+    if profile == "high_stakes" and route not in {"reviewed", "distributed"}:
+        errors.append("high_stakes profile requires reviewed or distributed route")
+    if route == "distributed" and topology not in {
+        "coordinator_workers",
+        "durable_serial",
+    }:
+        errors.append(
+            "distributed route requires coordinator_workers or durable_serial"
+        )
+
+    dimensions = plan.get("verification_dimensions")
+    if not _string_list(dimensions, nonempty=True):
+        errors.append("plan verification_dimensions must be non-empty")
+        dimensions_set: set[str] = set()
+    else:
+        dimensions_set = set(dimensions)
+    if profile in PROFILE_VERIFICATION_DIMENSIONS:
+        missing_dimensions = PROFILE_VERIFICATION_DIMENSIONS[profile] - dimensions_set
+        if missing_dimensions:
+            errors.append(
+                "missing verification dimensions: "
+                + ", ".join(sorted(missing_dimensions))
+            )
+
+    available_checks: set[str] = set()
+    if checks.get("schema") != "workloop-checks/1":
+        errors.append("checks.json schema must be workloop-checks/1")
+    for collection in (checks.get("checks"), checks.get("manual")):
+        if not isinstance(collection, list):
+            errors.append("checks.json checks and manual must be arrays")
+            continue
+        for criterion in collection:
+            if isinstance(criterion, dict) and _valid_identifier(criterion.get("id")):
+                available_checks.add(criterion["id"])
+
+    steps = plan.get("steps")
+    step_by_id: dict[str, dict[str, Any]] = {}
+    if not isinstance(steps, list) or not steps:
+        errors.append("plan requires at least one executable step")
+        steps = []
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            errors.append(f"steps[{index}] must be an object")
+            continue
+        step_id = step.get("id")
+        if not _valid_identifier(step_id):
+            errors.append(f"steps[{index}].id is invalid")
+            continue
+        if step_id in step_by_id:
+            errors.append(f"duplicate plan step: {step_id}")
+        step_by_id[step_id] = step
+        for field in ("description", "deliverable", "owner_role", "rollback"):
+            if not _nonempty_string(step.get(field)):
+                errors.append(f"step {step_id}.{field} is required")
+        for field in (
+            "depends_on",
+            "goal_criteria",
+            "check_ids",
+            "write_scope",
+            "capabilities",
+        ):
+            if not _string_list(step.get(field)):
+                errors.append(f"step {step_id}.{field} must be a string array")
+        if not _string_list(step.get("check_ids"), nonempty=True):
+            errors.append(f"step {step_id} requires at least one check_id")
+        effect = step.get("effect")
+        if effect not in {"workspace-local", "external", "irreversible"}:
+            errors.append(f"step {step_id}.effect is invalid")
+        approval = step.get("approval")
+        if not isinstance(approval, dict):
+            errors.append(f"step {step_id}.approval must be an object")
+        else:
+            required = approval.get("required")
+            if not isinstance(required, bool):
+                errors.append(f"step {step_id}.approval.required must be boolean")
+            if approval.get("status") not in {"not-required", "pending", "approved"}:
+                errors.append(f"step {step_id}.approval.status is invalid")
+            if not _nonempty_string(approval.get("owner")):
+                errors.append(f"step {step_id}.approval.owner is required")
+            if effect in {"external", "irreversible"} and required is not True:
+                errors.append(f"step {step_id} external effect requires approval")
+            if effect not in allowed_actions and effect not in approval_actions:
+                errors.append(
+                    f"step {step_id} effect is outside Goal authority: {effect}"
+                )
+            if effect in approval_actions and required is not True:
+                errors.append(f"step {step_id} effect requires Goal-level approval")
+
+    execution_owners = {
+        step.get("owner_role") for step in steps if isinstance(step, dict)
+    }
+    if route in {"reviewed", "distributed"} and verifier in execution_owners:
+        errors.append("verification owner must be distinct from execution owners")
+    if topology == "coordinator_workers" and len(step_by_id) < 2:
+        errors.append("coordinator_workers requires at least two bounded steps")
+
+    for step_id, step in step_by_id.items():
+        for dependency in step.get("depends_on", []):
+            if dependency not in step_by_id:
+                errors.append(f"step {step_id} has unknown dependency: {dependency}")
+        for criterion_id in step.get("goal_criteria", []):
+            if criterion_id not in criteria_ids:
+                errors.append(
+                    f"step {step_id} references unknown goal criterion: {criterion_id}"
+                )
+        for check_id in step.get("check_ids", []):
+            if check_id not in available_checks:
+                errors.append(f"step {step_id} references unknown check: {check_id}")
+
+    visited: set[str] = set()
+    visiting: set[str] = set()
+
+    def visit(step_id: str) -> None:
+        if step_id in visiting:
+            errors.append(f"plan dependency cycle includes: {step_id}")
+            return
+        if step_id in visited:
+            return
+        visiting.add(step_id)
+        for dependency in step_by_id[step_id].get("depends_on", []):
+            if dependency in step_by_id:
+                visit(dependency)
+        visiting.remove(step_id)
+        visited.add(step_id)
+
+    for step_id in step_by_id:
+        visit(step_id)
+
+    for criterion_id in criteria_ids:
+        covering = [
+            step
+            for step in steps
+            if isinstance(step, dict) and criterion_id in step.get("goal_criteria", [])
+        ]
+        if not covering:
+            errors.append(f"uncovered goal criterion: {criterion_id}")
+        elif not any(step.get("check_ids") for step in covering):
+            errors.append(f"goal criterion has no check coverage: {criterion_id}")
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for step in steps:
+        if isinstance(step, dict) and _nonempty_string(step.get("parallel_group")):
+            grouped.setdefault(step["parallel_group"], []).append(step)
+    for group, members in grouped.items():
+        for index, left in enumerate(members):
+            for right in members[index + 1 :]:
+                if any(
+                    _scopes_overlap(left_scope, right_scope)
+                    for left_scope in left.get("write_scope", [])
+                    for right_scope in right.get("write_scope", [])
+                ):
+                    errors.append(
+                        "overlapping parallel write scopes in "
+                        f"{group}: {left.get('id')} and {right.get('id')}"
+                    )
+
+    budget = plan.get("budget")
+    if not isinstance(budget, dict):
+        errors.append("plan budget must be an object")
+    else:
+        minutes = budget.get("wall_clock_minutes")
+        retries = budget.get("retry_limit")
+        if (
+            not isinstance(minutes, (int, float))
+            or isinstance(minutes, bool)
+            or minutes <= 0
+        ):
+            errors.append("plan budget.wall_clock_minutes must be positive")
+        if (
+            not isinstance(retries, int)
+            or isinstance(retries, bool)
+            or not 0 <= retries <= 10
+        ):
+            errors.append("plan budget.retry_limit must be an integer from 0 to 10")
+    if not _string_list(plan.get("stop_conditions"), nonempty=True):
+        errors.append("plan stop_conditions must be non-empty")
+    fallback = plan.get("fallback")
+    if (
+        not isinstance(fallback, dict)
+        or fallback.get("mode") not in {"durable_serial", "stop_and_handoff"}
+        or not _nonempty_string(fallback.get("trigger"))
+    ):
+        errors.append("plan fallback must define mode and trigger")
+    return errors
+
+
 def scan_tracked_episode(episode: Path) -> list[dict[str, Any]]:
     """Return redacted structural and secret findings for Git-visible episode files."""
 
     findings: list[dict[str, Any]] = []
     names = {path.name for path in episode.iterdir()}
-    for missing in sorted(TRACKED_EPISODE_FILES - names):
+    tracked_files = LEGACY_TRACKED_EPISODE_FILES
+    try:
+        manifest = json.loads((episode / "manifest.json").read_text(encoding="utf-8"))
+        if (
+            isinstance(manifest, dict)
+            and manifest.get("schema") == "workloop-episode/3"
+        ):
+            tracked_files = V3_TRACKED_EPISODE_FILES
+    except (OSError, json.JSONDecodeError):
+        pass
+    for missing in sorted(tracked_files - names):
         findings.append({"path": missing, "line": None, "rule": "missing-file"})
-    for unexpected in sorted(names - TRACKED_EPISODE_FILES - IGNORED_EPISODE_ENTRIES):
+    for unexpected in sorted(names - tracked_files - IGNORED_EPISODE_ENTRIES):
         findings.append(
             {"path": unexpected, "line": None, "rule": "unexpected-tracked-surface"}
         )
 
-    for name in sorted(TRACKED_EPISODE_FILES & names):
+    for name in sorted(tracked_files & names):
         path = episode / name
         if path.is_symlink() or not path.is_file():
             findings.append({"path": name, "line": None, "rule": "not-regular-file"})

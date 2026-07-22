@@ -4,13 +4,13 @@
     "name": "Leo Wang"
   },
   "metadata": {
-    "description": "Risk-based process router for AI coding agents",
-    "version": "0.6.0"
+    "description": "Risk-routed, evidence-gated work orchestrator (PDCA over four routes)",
+    "version": "0.7.0"
   },
   "plugins": [
     {
       "name": "adaptive-workloop",
-      "description": "Route non-trivial engineering work through the smallest loop that can prove completion. Probes host capability and task risk, then routes to Direct, Verified, Reviewed, or Distributed.",
+      "description": "Scale process to task risk, prove completion with auditable evidence, stay brand-blind across models, and never let capability expand authority — a Goal→Plan→Do→Check→Act loop over Direct/Verified/Reviewed/Distributed.",
       "source": "./"
     }
   ]

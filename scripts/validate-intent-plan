@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""Validate the Goal and Plan gates for a workloop episode."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+from workloop_core import validate_episode_readiness  # noqa: E402
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("episode", type=Path)
+    args = parser.parse_args()
+    episode = args.episode.resolve()
+    if not episode.is_dir():
+        print(f"validate-intent-plan: episode not found: {episode}", file=sys.stderr)
+        return 2
+    errors = validate_episode_readiness(episode)
+    if errors:
+        for error in errors:
+            print(f"validate-intent-plan: {error}", file=sys.stderr)
+        return 1
+    print("validate-intent-plan: PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

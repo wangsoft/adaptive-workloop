@@ -12,6 +12,8 @@ Read only the selected route after reading this precedence section.
 
 Discover specialists through the host manifest or host tool search at the phase boundary. Do not infer a complete catalog by scanning and truncating home directories.
 
+Agent roles are selected in `plan.json`; they are not spawned by default. Each dispatch receives one bounded step using the envelope in `goal-plan.md`. Workers may not edit Goal, Plan, route, policy, or Memory, and default maximum delegation depth is one. If dispatch is unavailable or uneconomic, keep the same ownership and verification boundaries under `durable_serial`.
+
 | Phase | Specialist examples | Inline fallback |
 |---|---|---|
 | Alignment | brainstorming, think, grill, planning | Restate outcome, scope and open ambiguity; ask only blocking questions |
@@ -37,7 +39,7 @@ State a one-line done criterion, make the smallest diff, run one obvious check i
 
 Use when deterministic checks exist or are cheap to add, no high-risk signal exists, and one agent/session is sufficient.
 
-1. Create a local episode and fill `contract.md` plus `checks.json` before editing.
+1. Create a local episode; pass Goal and Plan gates before editing.
 2. For a bug, add a regression criterion that fails on the old behavior.
 3. Implement one bounded increment; run the narrowest relevant check.
 4. At a coherent boundary, run `verify-contract <episode-dir>`.
@@ -51,7 +53,7 @@ No honest check means Route 2 is unavailable. Build the smallest seam first or u
 
 Use for high-risk work, subjective completion, or weak/missing deterministic proof.
 
-Follow Route 2 where checks exist, then run a verifier with fresh context. Give it the contract, full diff, repository pointers, and probe/capability summary—not the builder's rationale.
+Follow Route 2 where checks exist, then run the `verification_owner_role` from `plan.json` with fresh context. Give it Goal criteria, Plan mappings, the contract, full diff/artifacts, repository pointers, and probe/capability summary—not the builder's rationale.
 
 ### Verifier protocol
 
@@ -81,8 +83,8 @@ If the Cost gate fails, keep one agent and use `durable-serial` execution with d
 
 ### Setup and loop
 
-1. Create a tracked episode. The contract names integration criteria, slice interfaces, dependency order, budgets, and stop conditions.
-2. Cut vertical, independently useful slices. Assign one isolated workspace and non-overlapping write set per worker.
+1. Create a tracked episode. Goal and Plan name integration criteria, slice interfaces, dependency order, budgets, and stop conditions.
+2. Cut vertical, independently useful slices. Assign one isolated workspace and non-overlapping `write_scope` per worker; the Plan Gate rejects overlap inside a parallel group.
 3. Give each worker a bounded handoff plus repository pointers. Child capabilities must be narrower than the coordinator's.
 4. Integrate one verified slice at a time; re-run integration checks after each merge.
 5. Append state transitions with `episode-state` and checkpoint `progress.md` before risk and at every boundary.

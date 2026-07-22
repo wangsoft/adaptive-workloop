@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 sys.dont_write_bytecode = True
-from workloop_core import repository_snapshot, skill_runtime_digest  # noqa: E402
+from workloop_core import (  # noqa: E402
+    PROFILE_VERIFICATION_DIMENSIONS,
+    repository_snapshot,
+    skill_runtime_digest,
+)
 
 
 ROUTES = ("verified", "reviewed", "distributed")
@@ -27,6 +31,7 @@ tracked/*/runtime.json
 tracked/*/capabilities.json
 tracked/*/evidence/
 tracked/*/.state.lock
+tracked/*/.learning.lock
 """
 
 
@@ -129,6 +134,12 @@ def parse_args() -> argparse.Namespace:
         "--storage", choices=("auto", "local", "tracked"), default="auto"
     )
     parser.add_argument("--capabilities", type=Path)
+    parser.add_argument(
+        "--profile",
+        choices=tuple(PROFILE_VERIFICATION_DIMENSIONS),
+        default="engineering",
+        help="domain verification profile for the Goal and Plan gates",
+    )
     return parser.parse_args()
 
 
@@ -160,7 +171,14 @@ def main() -> int:
     assets_dir = skill_dir / "assets"
     required_assets = [
         assets_dir / name
-        for name in ("contract.md", "progress.md", "handoff.md", "checks.json")
+        for name in (
+            "contract.md",
+            "progress.md",
+            "handoff.md",
+            "checks.json",
+            "goal.json",
+            "plan.json",
+        )
     ]
     missing = [str(path) for path in required_assets if not path.is_file()]
     if missing:
@@ -220,11 +238,13 @@ def main() -> int:
     created_at = timestamp(now)
     episode_id = episode.name
     manifest = {
-        "schema": "workloop-episode/2",
+        "schema": "workloop-episode/3",
         "episode_id": episode_id,
         "created_at": created_at,
         "task": args.task.strip(),
         "route": args.route,
+        "work_domain": {"profile": args.profile},
+        "workspace": {"kind": "git" if inside_git else "artifact-root", "root": "."},
         "storage": storage,
         "model": {"id": args.model or "unknown", "source": "self-report"},
         "host": runtime.get("host", {"name": "unknown"}),
@@ -271,6 +291,17 @@ def main() -> int:
         json.dumps(event, sort_keys=True) + "\n", encoding="utf-8"
     )
     (episode / "checks.json").write_bytes((assets_dir / "checks.json").read_bytes())
+    goal = json.loads((assets_dir / "goal.json").read_text(encoding="utf-8"))
+    goal["outcome"] = args.task.strip()
+    goal["profile"] = args.profile
+    write_json(episode / "goal.json", goal)
+    plan = json.loads((assets_dir / "plan.json").read_text(encoding="utf-8"))
+    plan["route"] = args.route
+    plan["verification_dimensions"] = sorted(
+        PROFILE_VERIFICATION_DIMENSIONS[args.profile]
+    )
+    write_json(episode / "plan.json", plan)
+    (episode / "learning-candidates.jsonl").write_text("", encoding="utf-8")
 
     replacements = {
         "TASK": args.task.strip(),
@@ -284,8 +315,9 @@ def main() -> int:
 
     print(f"Episode created: {episode}")
     print("  manifest.json  state.json  events.jsonl  runtime.json")
-    print("  contract.md  checks.json  progress.md  handoff.md  evidence/")
-    print("Next: fill contract.md and checks.json BEFORE the first edit")
+    print("  goal.json  plan.json  contract.md  checks.json  progress.md")
+    print("  handoff.md  learning-candidates.jsonl  evidence/")
+    print("Next: pass Goal and Plan gates BEFORE the first edit")
     print(f"Verify later with: {skill_dir / 'scripts' / 'verify-contract'} {episode}")
     return 0
 

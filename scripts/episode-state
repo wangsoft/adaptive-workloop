@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 sys.dont_write_bytecode = True
-from workloop_core import scan_tracked_episode  # noqa: E402
+from workloop_core import scan_tracked_episode, validate_episode_readiness  # noqa: E402
 
 
 STATUSES = ("open", "in_progress", "blocked", "verified", "complete", "cancelled")
@@ -103,6 +103,15 @@ def validate_grading(episode: Path, *, recorded_digest: str | None = None) -> st
         raise VerificationGateError("grading.json has an invalid schema")
     if grading.get("checks_digest") != file_digest(checks_path):
         raise VerificationGateError("grading checks digest does not match checks.json")
+    try:
+        manifest = load_json(episode / "manifest.json")
+    except ValueError as exc:
+        raise VerificationGateError(str(exc)) from exc
+    if manifest.get("schema") == "workloop-episode/3":
+        if grading.get("goal_digest") != file_digest(episode / "goal.json"):
+            raise VerificationGateError("grading goal digest does not match goal.json")
+        if grading.get("plan_digest") != file_digest(episode / "plan.json"):
+            raise VerificationGateError("grading plan digest does not match plan.json")
 
     expected_checks = checks.get("checks")
     expected_manual = checks.get("manual")
@@ -361,7 +370,19 @@ def main() -> int:
             return 1
         events = load_events(events_path, manifest.get("episode_id"), manifest_digest)
         evidence_digests: dict[str, str] = {}
+        readiness_digests: dict[str, str] = {}
         try:
+            if (
+                args.status == "in_progress"
+                and manifest.get("schema") == "workloop-episode/3"
+            ):
+                readiness_errors = validate_episode_readiness(episode)
+                if readiness_errors:
+                    raise VerificationGateError("; ".join(readiness_errors))
+                readiness_digests = {
+                    name: file_digest(episode / name)
+                    for name in ("goal.json", "plan.json", "checks.json")
+                }
             if args.status == "verified":
                 evidence_digests = validate_verified_transition(
                     episode, kind=args.kind, evidence=args.evidence
@@ -371,7 +392,12 @@ def main() -> int:
                     episode, kind=args.kind, previous_event=events[-1]
                 )
         except VerificationGateError as exc:
-            print(f"episode-state: verification gate: {exc}", file=sys.stderr)
+            gate = (
+                "readiness gate"
+                if args.status == "in_progress"
+                else "verification gate"
+            )
+            print(f"episode-state: {gate}: {exc}", file=sys.stderr)
             return 1
         if args.status == "complete" and manifest.get("storage") == "tracked":
             findings = scan_tracked_episode(episode)
@@ -398,6 +424,12 @@ def main() -> int:
         }
         if evidence_digests:
             event["evidence_digests"] = evidence_digests
+        if readiness_digests:
+            event["readiness_digests"] = readiness_digests
+            try:
+                event["route"] = load_json(episode / "plan.json").get("route")
+            except ValueError:
+                pass
         with events_path.open("a", encoding="utf-8") as events:
             events.write(json.dumps(event, sort_keys=True) + "\n")
             events.flush()

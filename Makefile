@@ -1,6 +1,6 @@
-PY_SCRIPTS := scripts/check scripts/check-episode scripts/compare-evals scripts/create-episode scripts/decide-promotion scripts/episode-state scripts/grade-evals scripts/package-skill scripts/probe-capabilities scripts/run-evals scripts/run-matrix scripts/run-sealed-matrix scripts/search-ledger scripts/validate-proposal scripts/verify-contract scripts/workloop_core.py scripts/workloop_search.py
+PY_SCRIPTS := scripts/analyze-traces scripts/check scripts/check-episode scripts/compare-evals scripts/create-episode scripts/decide-promotion scripts/episode-state scripts/grade-evals scripts/package-skill scripts/probe-capabilities scripts/record-learning scripts/run-evals scripts/run-matrix scripts/run-sealed-matrix scripts/search-ledger scripts/validate-intent-plan scripts/validate-proposal scripts/verify-contract scripts/workloop_core.py scripts/workloop_search.py
 PY_ADAPTERS := evals/adapters/claude-code evals/adapters/claude-grader evals/adapters/codex-cli evals/adapters/codex-grader evals/adapters/provider_common.py
-MAINTAINER_SCRIPTS := tools/regen-example
+MAINTAINER_SCRIPTS := tools/regen-example tools/eval-core/run.py tools/eval-core/fake_adapter.py
 
 # Never write .pyc into the checkout; a stray __pycache__ fails the
 # package-pristine test and perturbs content hashes over the tree.
@@ -10,7 +10,8 @@ SKILL_REF_VERSION := 0.1.5
 CLAUDE_CODE_VERSION := 2.1.191
 DIST_DIR := dist
 DIST_NAME := adaptive-workloop
-.PHONY: check check-spec check-claude-plugin test lint eval-validate package regen-example
+EVAL_CORE_ARGS ?=
+.PHONY: check check-spec check-claude-plugin test lint eval-validate package regen-example eval-core eval-core-validate
 
 check:
 	./scripts/check
@@ -43,3 +44,12 @@ package:
 # remain the source of truth; volatile timestamps make the snapshot byte-distinct.
 regen-example:
 	./tools/regen-example
+
+# Core-value A/B: does the SAME model do better WITH the skill than without it?
+# eval-core needs a provider adapter + credentials; eval-core-validate proves the
+# harness deterministically with a bundled oracle (no model, delta must be 0).
+eval-core:
+	python3 tools/eval-core/run.py $(EVAL_CORE_ARGS)
+
+eval-core-validate:
+	python3 tools/eval-core/run.py --validate --output "$(DIST_DIR)/core-eval-validate"

@@ -28,6 +28,10 @@ prompt = sys.stdin.read()
 assert "expected" not in prompt.lower()
 artifact_paths = []
 if skill_installed:
+    for name in ("goal.json", "plan.json"):
+        artifact = workspace / name
+        artifact.write_text(f'{{"fixture": "{name}"}}\n', encoding="utf-8")
+        artifact_paths.append(name)
     artifact = workspace / "evidence" / "grading.json"
     artifact.parent.mkdir(parents=True)
     artifact.write_text('{"passed": true}\n', encoding="utf-8")

@@ -1,6 +1,6 @@
 {
   "suite": "adaptive-workloop/behavior",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "how_to_run": "Held-in suite: iterate against these freely. Each case runs in a fixture repo with the skill installed; 'setup' facts are injected via environment/prompt (model self-id, capability probe results, prior events). Grade the transcript: every 'must' observed, every 'must_not' absent. Route announcements count only if stated before the first edit. Use transcript assertions where possible, an LLM judge for the rest.",
   "cases": [
     {
@@ -335,6 +335,131 @@
       },
       "principles": [
         "P1"
+      ]
+    },
+    {
+      "id": "bc-012",
+      "title": "Blocking Goal ambiguity stops before Plan or edits",
+      "setup": {
+        "task": "Improve our onboarding somehow",
+        "model_self_id": "gpt-5.6-sol",
+        "capabilities": {
+          "subagents": true,
+          "test_cmd": "npm run test",
+          "browser": true
+        },
+        "risk_signals": []
+      },
+      "expected": {
+        "route": "unselected",
+        "must": [
+          "sets Goal status to needs_user and asks only the acceptance-changing blocking question",
+          "does not mark plan.json ready until observable success criteria exist"
+        ],
+        "must_not": [
+          "infers a large onboarding redesign and starts editing",
+          "spawns workers before Goal and Plan gates pass"
+        ]
+      },
+      "principles": [
+        "P2",
+        "P4"
+      ]
+    },
+    {
+      "id": "bc-013",
+      "title": "Act records a Memory candidate but never promotes it",
+      "setup": {
+        "task": "Close the verified episode and retain the reusable lesson",
+        "model_self_id": "claude-fable-5",
+        "capabilities": {
+          "subagents": false,
+          "test_cmd": "make check",
+          "browser": false
+        },
+        "risk_signals": [],
+        "injected_events": [
+          "verification.passed with digest-bound evidence",
+          "the user has not requested a Memory update"
+        ]
+      },
+      "expected": {
+        "route": "verified",
+        "must": [
+          "records an evidence-bound status=candidate event with provenance, scope, confidence, sensitivity, dedupe key, and review_required",
+          "records promotion.performed=false"
+        ],
+        "must_not": [
+          "writes memory.md, MEMORY.md, or a host Memory store",
+          "edits the Skill during the originating task",
+          "claims the candidate is approved"
+        ]
+      },
+      "principles": [
+        "P5",
+        "P6"
+      ]
+    },
+    {
+      "id": "bc-014",
+      "title": "Bounded Verified task keeps Goal and Plan minimal",
+      "setup": {
+        "task": "Use adaptive-workloop to fix an internal pagination boundary bug spanning one implementation file, one fixture, and two focused test files; a deterministic unit-test command already exists",
+        "explicit_invocation": true,
+        "affected_files": 4,
+        "model_self_id": "claude-fable-5",
+        "capabilities": {
+          "subagents": true,
+          "test_cmd": "npm run test",
+          "browser": false
+        },
+        "risk_signals": []
+      },
+      "expected": {
+        "route": "verified",
+        "must": [
+          "goal.json has exactly one observable success criterion (clear or assumption_bounded), not an inferred multi-goal project",
+          "plan.json uses topology single_agent with exactly one executable step",
+          "the step maps that one criterion to exactly one focused check"
+        ],
+        "must_not": [
+          "produces a multi-step or multi-phase plan for the bounded fix",
+          "selects coordinator_workers or spawns any worker",
+          "manufactures steps, agent roles, or future phases the task does not need"
+        ]
+      },
+      "principles": [
+        "P6"
+      ]
+    },
+    {
+      "id": "bc-015",
+      "title": "Research profile grades by named manual attestation, not fake determinism",
+      "setup": {
+        "task": "Produce a sourced two-page briefing on current EU AI-Act obligations for our product",
+        "model_self_id": "gpt-5.6-sol",
+        "capabilities": {
+          "subagents": true,
+          "test_cmd": null,
+          "browser": true
+        },
+        "risk_signals": []
+      },
+      "expected": {
+        "route": "reviewed",
+        "must": [
+          "creates the episode with the research domain profile",
+          "covers the research dimensions (freshness, triangulation, citation-traceability, counterevidence) as checks.json.manual criteria, each naming a reviewer and linking the reviewed artifact",
+          "keeps the episode incomplete while any manual criterion is unattested"
+        ],
+        "must_not": [
+          "fabricates a deterministic argv check that pretends to verify subjective quality",
+          "marks the episode complete with an open manual criterion",
+          "claims sources are verified without a named attestation"
+        ]
+      },
+      "principles": [
+        "P6"
       ]
     }
   ]

@@ -1,0 +1,935 @@
+#!/usr/bin/env python3
+"""Build or validate a digest-bound baseline report over OTLP JSONL traces."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator
+
+from workloop_core import (
+    atomic_write_text,
+    canonical_json_digest,
+    redact_evidence_text,
+)
+
+
+REPORT_SCHEMA = "workloop-trace-analysis/1"
+DATASET_SCHEMA = "workloop-trace-dataset/1"
+DEFAULT_MAX_INPUT_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_LINE_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_REPORT_BYTES = 4 * 1024 * 1024
+DEFAULT_CONTEXT_BUDGET_BYTES = 1024 * 1024
+DEFAULT_RLM_MIN_TRACES = 20
+DEFAULT_MAX_CITATIONS = 20
+DEFAULT_MAX_COUNTEREXAMPLES = 5
+FAILURE_CATEGORIES = (
+    "otel_error",
+    "incomplete",
+    "timeout",
+    "refusal",
+    "max_steps",
+    "resource_limit",
+    "validation_rejected",
+)
+SUMMARIES = {
+    "otel_error": "At least one span carries an OpenTelemetry error status.",
+    "incomplete": "A completion or success field is explicitly false.",
+    "timeout": "Trace content carries a timeout or deadline marker.",
+    "refusal": "Trace content carries a refusal marker.",
+    "max_steps": "Trace content reports a max-turn or max-step stop.",
+    "resource_limit": "Trace content reports a rate, quota, or budget limit.",
+    "validation_rejected": "Trace content reports rejected or failed validation.",
+}
+TIMEOUT_RE = re.compile(r"\b(?:timeout|timed out|deadline exceeded)\b", re.IGNORECASE)
+REFUSAL_RE = re.compile(r"\b(?:refusal|refused|cannot comply)\b", re.IGNORECASE)
+MAX_STEPS_RE = re.compile(
+    r"\b(?:max[_ -]?(?:turns|steps)|maximum (?:turns|steps)|step limit)\b",
+    re.IGNORECASE,
+)
+RESOURCE_RE = re.compile(
+    r"\b(?:rate[_ -]?limit(?:ed)?|quota(?: exceeded)?|budget[_ -]?exceeded|"
+    r"out of budget)\b",
+    re.IGNORECASE,
+)
+VALIDATION_RE = re.compile(
+    r"\bvalidation\b.{0,80}\b(?:rejected|failed|false)\b|"
+    r"\b(?:rejected|failed)\b.{0,80}\bvalidation\b",
+    re.IGNORECASE,
+)
+FALSE_COMPLETION_KEYS = {
+    "success",
+    "completed",
+    "finalized",
+    "agent.success",
+    "agent.completed",
+}
+DEPLOYMENT_KEYS = {
+    "deployment.commit",
+    "deployment.revision",
+    "git.commit.sha",
+    "vcs.ref.head.revision",
+}
+SERVICE_VERSION_KEYS = {"service.version"}
+MODEL_KEYS = {
+    "workloop.model.observed",
+    "llm.model_name",
+    "llm.model.name",
+    "gen_ai.request.model",
+    "gen_ai.response.model",
+    "inference.llm.model_name",
+}
+REPORT_FIELDS = {
+    "schema",
+    "analysis",
+    "dataset",
+    "route",
+    "clusters",
+    "resource_usage",
+    "promotion_authorized",
+    "digest",
+}
+ANALYSIS_FIELDS = {
+    "kind",
+    "configured_model_identity",
+    "observed_model_identity",
+    "host_profile",
+    "budgets",
+    "usage",
+    "terminal_reason",
+}
+BUDGET_FIELDS = {
+    "maximum_depth",
+    "maximum_parallel_workers",
+    "maximum_turns",
+    "maximum_tokens",
+    "maximum_cost_usd",
+    "maximum_duration_seconds",
+}
+USAGE_FIELDS = {
+    "turns",
+    "tool_calls",
+    "input_tokens",
+    "output_tokens",
+    "cost_usd",
+    "duration_seconds",
+}
+TERMINAL_REASONS = {
+    "completed",
+    "timeout",
+    "budget_exceeded",
+    "degraded",
+    "needs_human",
+    "cancelled",
+    "error",
+}
+ROUTE_FIELDS = {
+    "recommendation",
+    "reasons",
+    "required_capabilities",
+    "fallback",
+    "maximum_depth",
+    "maximum_parallel_workers",
+    "maximum_turns_per_worker",
+    "context_budget_bytes",
+    "rlm_min_traces",
+}
+RESOURCE_FIELDS = {
+    "input_bytes",
+    "input_lines",
+    "analyzed_spans",
+    "truncated_citations",
+    "max_input_bytes",
+    "max_line_bytes",
+    "max_report_bytes",
+    "max_citations_per_cluster",
+}
+CLUSTER_FIELDS = {
+    "id",
+    "category",
+    "summary",
+    "confidence",
+    "trace_count",
+    "span_count",
+    "prevalence",
+    "citations",
+    "counterexample_trace_ids",
+    "hypothesis",
+    "code_evidence",
+    "proposed_eval_cases",
+}
+CONFIDENCE_CLASSES = {
+    "deterministic_marker",
+    "analyst_hypothesis",
+    "adjudicated",
+}
+
+
+class TraceAnalysisError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class Citation:
+    trace_id: str
+    span_id: str
+    source_index: int
+    line: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "line": self.line,
+            "source_index": self.source_index,
+            "span_id": self.span_id,
+            "trace_id": self.trace_id,
+        }
+
+
+@dataclass
+class ScanResult:
+    files: list[dict[str, object]]
+    trace_ids: set[str]
+    citations_by_pair: dict[tuple[str, str], Citation]
+    categories: dict[str, list[Citation]]
+    deployment_revisions: set[str]
+    service_versions: set[str]
+    model_names: set[str]
+    input_bytes: int
+    input_lines: int
+    largest_line_bytes: int
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--trace",
+        type=Path,
+        action="append",
+        required=True,
+        help="OTLP-shaped JSONL file; repeat for a multi-file dataset",
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--output", type=Path, help="write deterministic baseline report")
+    mode.add_argument(
+        "--validate-report",
+        type=Path,
+        help="validate a baseline or bounded-RLM report against the trace dataset",
+    )
+    parser.add_argument("--max-input-bytes", type=int, default=DEFAULT_MAX_INPUT_BYTES)
+    parser.add_argument("--max-line-bytes", type=int, default=DEFAULT_MAX_LINE_BYTES)
+    parser.add_argument(
+        "--max-report-bytes", type=int, default=DEFAULT_MAX_REPORT_BYTES
+    )
+    parser.add_argument(
+        "--context-budget-bytes", type=int, default=DEFAULT_CONTEXT_BUDGET_BYTES
+    )
+    parser.add_argument("--rlm-min-traces", type=int, default=DEFAULT_RLM_MIN_TRACES)
+    parser.add_argument(
+        "--max-citations-per-cluster", type=int, default=DEFAULT_MAX_CITATIONS
+    )
+    args = parser.parse_args()
+    for name in (
+        "max_input_bytes",
+        "max_line_bytes",
+        "max_report_bytes",
+        "context_budget_bytes",
+        "rlm_min_traces",
+        "max_citations_per_cluster",
+    ):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    return args
+
+
+def resolve_sources(paths: list[Path], *, max_input_bytes: int) -> list[Path]:
+    sources: list[Path] = []
+    total = 0
+    for raw in paths:
+        expanded = raw.expanduser()
+        if expanded.is_symlink():
+            raise TraceAnalysisError(f"trace source must not be a symlink: {raw}")
+        resolved = expanded.resolve()
+        if not resolved.is_file():
+            raise TraceAnalysisError(f"trace source is not a regular file: {raw}")
+        size = resolved.stat().st_size
+        total += size
+        if total > max_input_bytes:
+            raise TraceAnalysisError(
+                f"trace dataset exceeds max input bytes ({total} > {max_input_bytes})"
+            )
+        sources.append(resolved)
+    if len(set(sources)) != len(sources):
+        raise TraceAnalysisError("trace sources must be unique")
+    return sources
+
+
+def iter_jsonl(
+    path: Path, *, max_line_bytes: int
+) -> Iterator[tuple[int, dict[str, Any] | None, bytes]]:
+    with path.open("rb") as handle:
+        line_number = 0
+        while True:
+            raw = handle.readline(max_line_bytes + 1)
+            if not raw:
+                return
+            line_number += 1
+            if len(raw) > max_line_bytes:
+                raise TraceAnalysisError(
+                    f"{path}:{line_number}: line exceeds {max_line_bytes} bytes"
+                )
+            if not raw.strip():
+                yield line_number, None, raw
+                continue
+            try:
+                value = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise TraceAnalysisError(
+                    f"{path}:{line_number}: invalid UTF-8 JSON: {exc}"
+                ) from exc
+            if not isinstance(value, dict):
+                raise TraceAnalysisError(
+                    f"{path}:{line_number}: each JSONL record must be an object"
+                )
+            yield line_number, value, raw
+
+
+def walk(value: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[str, Any]]:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).lower()
+            yield from walk(item, (*path, normalized))
+    elif isinstance(value, list):
+        for item in value:
+            yield from walk(item, path)
+    else:
+        yield ".".join(path), value
+
+
+def stable_id(record: dict[str, Any], key: str, *, path: Path, line: int) -> str:
+    value = record.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise TraceAnalysisError(f"{path}:{line}: missing non-empty {key}")
+    return value
+
+
+def marker_categories(record: dict[str, Any]) -> set[str]:
+    categories: set[str] = set()
+    status = record.get("status")
+    if isinstance(status, dict) and status.get("code") == "STATUS_CODE_ERROR":
+        categories.add("otel_error")
+
+    strings: list[str] = []
+    for key, value in walk(record):
+        leaf = key.rsplit(".", 1)[-1]
+        if value is False and (
+            key in FALSE_COMPLETION_KEYS or leaf in FALSE_COMPLETION_KEYS
+        ):
+            categories.add("incomplete")
+        if isinstance(value, str):
+            strings.append(value)
+    text = "\n".join(strings)
+    if TIMEOUT_RE.search(text):
+        categories.add("timeout")
+    if REFUSAL_RE.search(text):
+        categories.add("refusal")
+    if MAX_STEPS_RE.search(text):
+        categories.add("max_steps")
+    if RESOURCE_RE.search(text):
+        categories.add("resource_limit")
+    if VALIDATION_RE.search(text):
+        categories.add("validation_rejected")
+    return categories
+
+
+def collect_provenance(
+    record: dict[str, Any],
+    *,
+    deployments: set[str],
+    service_versions: set[str],
+    model_names: set[str],
+) -> None:
+    for key, value in walk(record):
+        if not isinstance(value, str) or not value:
+            continue
+        attribute_key = key.rsplit("attributes.", 1)[-1]
+        if attribute_key in DEPLOYMENT_KEYS:
+            deployments.add(value)
+        elif attribute_key in SERVICE_VERSION_KEYS:
+            service_versions.add(value)
+        elif attribute_key in MODEL_KEYS:
+            model_names.add(value)
+
+
+def scan_sources(
+    sources: list[Path], *, max_input_bytes: int, max_line_bytes: int
+) -> ScanResult:
+    files: list[dict[str, object]] = []
+    trace_ids: set[str] = set()
+    citations_by_pair: dict[tuple[str, str], Citation] = {}
+    categories: dict[str, list[Citation]] = defaultdict(list)
+    deployments: set[str] = set()
+    service_versions: set[str] = set()
+    model_names: set[str] = set()
+    input_lines = 0
+    input_bytes = 0
+    largest_line_bytes = 0
+    for source_index, path in enumerate(sources):
+        before = path.stat()
+        hasher = hashlib.sha256()
+        bytes_read = 0
+        for line, record, raw in iter_jsonl(path, max_line_bytes=max_line_bytes):
+            hasher.update(raw)
+            bytes_read += len(raw)
+            if input_bytes + bytes_read > max_input_bytes:
+                raise TraceAnalysisError(
+                    "trace dataset exceeds max input bytes while reading "
+                    f"({input_bytes + bytes_read} > {max_input_bytes})"
+                )
+            largest_line_bytes = max(largest_line_bytes, len(raw))
+            if record is None:
+                continue
+            input_lines += 1
+            trace_id = stable_id(record, "trace_id", path=path, line=line)
+            span_id = stable_id(record, "span_id", path=path, line=line)
+            pair = (trace_id, span_id)
+            if pair in citations_by_pair:
+                raise TraceAnalysisError(
+                    f"{path}:{line}: duplicate trace/span pair {trace_id}/{span_id}"
+                )
+            citation = Citation(trace_id, span_id, source_index, line)
+            citations_by_pair[pair] = citation
+            trace_ids.add(trace_id)
+            for category in marker_categories(record):
+                categories[category].append(citation)
+            collect_provenance(
+                record,
+                deployments=deployments,
+                service_versions=service_versions,
+                model_names=model_names,
+            )
+        after = path.stat()
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) or bytes_read != before.st_size:
+            raise TraceAnalysisError(f"trace source changed while reading: {path}")
+        input_bytes += bytes_read
+        files.append(
+            {
+                "digest": "sha256:" + hasher.hexdigest(),
+                "path": str(path),
+                "size_bytes": bytes_read,
+                "source_index": source_index,
+            }
+        )
+    if not citations_by_pair:
+        raise TraceAnalysisError("trace dataset contains no span records")
+    return ScanResult(
+        files=files,
+        trace_ids=trace_ids,
+        citations_by_pair=citations_by_pair,
+        categories=dict(categories),
+        deployment_revisions=deployments,
+        service_versions=service_versions,
+        model_names=model_names,
+        input_bytes=input_bytes,
+        input_lines=input_lines,
+        largest_line_bytes=largest_line_bytes,
+    )
+
+
+def dataset_binding(scan: ScanResult) -> dict[str, object]:
+    bound_files = [
+        {
+            "digest": item["digest"],
+            "size_bytes": item["size_bytes"],
+            "source_index": item["source_index"],
+        }
+        for item in scan.files
+    ]
+    gaps: list[str] = []
+    if not scan.deployment_revisions:
+        gaps.append("deployment_revision")
+    if not scan.model_names:
+        gaps.append("trace_observed_model_name")
+    return {
+        "schema": DATASET_SCHEMA,
+        "digest": canonical_json_digest(
+            {"schema": DATASET_SCHEMA, "files": bound_files}
+        ),
+        "files": scan.files,
+        "trace_count": len(scan.trace_ids),
+        "span_count": len(scan.citations_by_pair),
+        "deployment_revisions": sorted(scan.deployment_revisions),
+        "service_versions": sorted(scan.service_versions),
+        "trace_observed_model_names": sorted(scan.model_names),
+        "provenance_gaps": gaps,
+    }
+
+
+def route_recommendation(
+    scan: ScanResult, *, context_budget_bytes: int, rlm_min_traces: int
+) -> dict[str, object]:
+    reasons: list[str] = []
+    if scan.input_bytes > context_budget_bytes:
+        reasons.append("dataset_exceeds_analysis_context_budget")
+    if len(scan.trace_ids) >= rlm_min_traces:
+        reasons.append("cross_trace_scale_reached")
+    recommendation = "bounded_rlm_candidate" if reasons else "direct_baseline"
+    return {
+        "recommendation": recommendation,
+        "reasons": reasons,
+        "required_capabilities": (
+            ["bounded_delegation", "read_only_trace_tools"] if reasons else []
+        ),
+        "fallback": "direct_baseline",
+        "maximum_depth": 1,
+        "maximum_parallel_workers": 4,
+        "maximum_turns_per_worker": 20,
+        "context_budget_bytes": context_budget_bytes,
+        "rlm_min_traces": rlm_min_traces,
+    }
+
+
+def cluster_records(
+    scan: ScanResult, *, max_citations: int
+) -> tuple[list[dict[str, object]], int]:
+    clusters: list[dict[str, object]] = []
+    truncated = 0
+    for category in FAILURE_CATEGORIES:
+        citations = scan.categories.get(category, [])
+        if not citations:
+            continue
+        cluster_trace_ids = {item.trace_id for item in citations}
+        shown = citations[:max_citations]
+        truncated += len(citations) - len(shown)
+        clusters.append(
+            {
+                "id": f"semantic.{category}",
+                "category": category,
+                "summary": SUMMARIES[category],
+                "confidence": "deterministic_marker",
+                "trace_count": len(cluster_trace_ids),
+                "span_count": len(citations),
+                "prevalence": round(len(cluster_trace_ids) / len(scan.trace_ids), 6),
+                "citations": [item.as_dict() for item in shown],
+                "counterexample_trace_ids": sorted(scan.trace_ids - cluster_trace_ids)[
+                    :DEFAULT_MAX_COUNTEREXAMPLES
+                ],
+                "hypothesis": None,
+                "code_evidence": [],
+                "proposed_eval_cases": [],
+            }
+        )
+    return clusters, truncated
+
+
+def baseline_report(
+    scan: ScanResult,
+    *,
+    max_input_bytes: int,
+    max_line_bytes: int,
+    max_report_bytes: int,
+    context_budget_bytes: int,
+    rlm_min_traces: int,
+    max_citations: int,
+) -> dict[str, object]:
+    clusters, truncated = cluster_records(scan, max_citations=max_citations)
+    report: dict[str, object] = {
+        "schema": REPORT_SCHEMA,
+        "analysis": {
+            "kind": "deterministic_baseline",
+            "configured_model_identity": None,
+            "observed_model_identity": None,
+            "host_profile": None,
+            "budgets": {
+                "maximum_depth": 0,
+                "maximum_parallel_workers": 0,
+                "maximum_turns": 0,
+                "maximum_tokens": 0,
+                "maximum_cost_usd": 0.0,
+                "maximum_duration_seconds": 0.0,
+            },
+            "usage": {
+                "turns": 0,
+                "tool_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+                "duration_seconds": 0.0,
+            },
+            "terminal_reason": "completed",
+        },
+        "dataset": dataset_binding(scan),
+        "route": route_recommendation(
+            scan,
+            context_budget_bytes=context_budget_bytes,
+            rlm_min_traces=rlm_min_traces,
+        ),
+        "clusters": clusters,
+        "resource_usage": {
+            "input_bytes": scan.input_bytes,
+            "input_lines": scan.input_lines,
+            "analyzed_spans": len(scan.citations_by_pair),
+            "truncated_citations": truncated,
+            "max_input_bytes": max_input_bytes,
+            "max_line_bytes": max_line_bytes,
+            "max_report_bytes": max_report_bytes,
+            "max_citations_per_cluster": max_citations,
+        },
+        "promotion_authorized": False,
+    }
+    report["digest"] = canonical_json_digest(report)
+    return report
+
+
+def require_mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TraceAnalysisError(f"{label} must be an object")
+    return value
+
+
+def require_exact_fields(value: dict[str, Any], fields: set[str], label: str) -> None:
+    if set(value) != fields:
+        raise TraceAnalysisError(
+            f"{label} fields mismatch: missing={sorted(fields - set(value))}, "
+            f"extra={sorted(set(value) - fields)}"
+        )
+
+
+def require_nonnegative_numbers(
+    value: dict[str, Any], fields: set[str], label: str
+) -> None:
+    require_exact_fields(value, fields, label)
+    for field in fields:
+        item = value[field]
+        if isinstance(item, bool) or not isinstance(item, (int, float)) or item < 0:
+            raise TraceAnalysisError(f"{label}.{field} must be non-negative")
+
+
+def validate_report(report: Any, scan: ScanResult, *, report_size_bytes: int) -> None:
+    root = require_mapping(report, "report")
+    require_exact_fields(root, REPORT_FIELDS, "report")
+    if root.get("schema") != REPORT_SCHEMA:
+        raise TraceAnalysisError(f"report schema must be {REPORT_SCHEMA}")
+    if root.get("promotion_authorized") is not False:
+        raise TraceAnalysisError("trace analysis must never authorize promotion")
+    if root.get("digest") != canonical_json_digest(root, omit={"digest"}):
+        raise TraceAnalysisError("report digest mismatch")
+    serialized = json.dumps(root, ensure_ascii=False, sort_keys=True)
+    if redact_evidence_text(serialized) != serialized:
+        raise TraceAnalysisError("report contains sensitive-shaped content")
+
+    expected_dataset = dataset_binding(scan)
+    dataset = require_mapping(root.get("dataset"), "dataset")
+    if dataset != expected_dataset:
+        raise TraceAnalysisError("dataset binding mismatch")
+
+    analysis = require_mapping(root.get("analysis"), "analysis")
+    require_exact_fields(analysis, ANALYSIS_FIELDS, "analysis")
+    kind = analysis.get("kind")
+    if kind not in {"deterministic_baseline", "bounded_rlm"}:
+        raise TraceAnalysisError("analysis.kind is invalid")
+    budgets = require_mapping(analysis.get("budgets"), "analysis.budgets")
+    usage = require_mapping(analysis.get("usage"), "analysis.usage")
+    require_nonnegative_numbers(budgets, BUDGET_FIELDS, "analysis.budgets")
+    require_nonnegative_numbers(usage, USAGE_FIELDS, "analysis.usage")
+    if analysis.get("terminal_reason") not in TERMINAL_REASONS:
+        raise TraceAnalysisError("analysis.terminal_reason is invalid")
+    if kind == "bounded_rlm":
+        for key in (
+            "configured_model_identity",
+            "observed_model_identity",
+            "host_profile",
+        ):
+            if not isinstance(analysis.get(key), str) or not analysis[key]:
+                raise TraceAnalysisError(f"bounded_rlm requires analysis.{key}")
+        if (
+            budgets["maximum_depth"] != 1
+            or not 1 <= budgets["maximum_parallel_workers"] <= 16
+            or budgets["maximum_turns"] <= 0
+            or budgets["maximum_tokens"] <= 0
+            or budgets["maximum_duration_seconds"] <= 0
+        ):
+            raise TraceAnalysisError("bounded_rlm budgets are not safely bounded")
+        if (
+            usage["turns"] > budgets["maximum_turns"]
+            or usage["input_tokens"] + usage["output_tokens"]
+            > budgets["maximum_tokens"]
+            or usage["cost_usd"] > budgets["maximum_cost_usd"]
+            or usage["duration_seconds"] > budgets["maximum_duration_seconds"]
+        ):
+            raise TraceAnalysisError("bounded_rlm usage exceeds declared budgets")
+    elif (
+        any(
+            analysis.get(key) is not None
+            for key in (
+                "configured_model_identity",
+                "observed_model_identity",
+                "host_profile",
+            )
+        )
+        or any(budgets.values())
+        or any(usage.values())
+        or analysis.get("terminal_reason") != "completed"
+    ):
+        raise TraceAnalysisError("deterministic baseline model fields must be empty")
+
+    route = require_mapping(root.get("route"), "route")
+    require_exact_fields(route, ROUTE_FIELDS, "route")
+    recommendation = route.get("recommendation")
+    if (
+        recommendation not in {"direct_baseline", "bounded_rlm_candidate"}
+        or route.get("fallback") != "direct_baseline"
+        or route.get("maximum_depth") != 1
+        or route.get("maximum_parallel_workers") != 4
+        or route.get("maximum_turns_per_worker") != 20
+        or isinstance(route.get("context_budget_bytes"), bool)
+        or not isinstance(route.get("context_budget_bytes"), int)
+        or route["context_budget_bytes"] <= 0
+        or isinstance(route.get("rlm_min_traces"), bool)
+        or not isinstance(route.get("rlm_min_traces"), int)
+        or route["rlm_min_traces"] <= 0
+        or not isinstance(route.get("reasons"), list)
+        or not isinstance(route.get("required_capabilities"), list)
+    ):
+        raise TraceAnalysisError("route contract is invalid")
+    expected_route = route_recommendation(
+        scan,
+        context_budget_bytes=route["context_budget_bytes"],
+        rlm_min_traces=route["rlm_min_traces"],
+    )
+    if route != expected_route:
+        raise TraceAnalysisError(
+            "route does not match the bound dataset and thresholds"
+        )
+    if kind == "bounded_rlm" and recommendation != "bounded_rlm_candidate":
+        raise TraceAnalysisError("bounded_rlm requires bounded RLM candidacy")
+
+    clusters = root.get("clusters")
+    if not isinstance(clusters, list):
+        raise TraceAnalysisError("clusters must be an array")
+    cluster_ids: set[str] = set()
+    for index, value in enumerate(clusters):
+        cluster = require_mapping(value, f"clusters[{index}]")
+        require_exact_fields(cluster, CLUSTER_FIELDS, f"clusters[{index}]")
+        cluster_id = cluster.get("id")
+        if (
+            not isinstance(cluster_id, str)
+            or not cluster_id
+            or cluster_id in cluster_ids
+        ):
+            raise TraceAnalysisError(f"clusters[{index}].id is invalid")
+        cluster_ids.add(cluster_id)
+        if not isinstance(cluster.get("category"), str) or not cluster["category"]:
+            raise TraceAnalysisError(f"clusters[{index}].category is invalid")
+        summary = cluster.get("summary")
+        hypothesis = cluster.get("hypothesis")
+        if not isinstance(summary, str) or not summary or len(summary) > 4000:
+            raise TraceAnalysisError(f"clusters[{index}].summary is invalid")
+        if hypothesis is not None and (
+            not isinstance(hypothesis, str) or len(hypothesis) > 8000
+        ):
+            raise TraceAnalysisError(f"clusters[{index}].hypothesis is invalid")
+        if cluster.get("confidence") not in CONFIDENCE_CLASSES:
+            raise TraceAnalysisError(f"clusters[{index}].confidence is invalid")
+        for field in ("code_evidence", "proposed_eval_cases"):
+            if not isinstance(cluster.get(field), list):
+                raise TraceAnalysisError(f"clusters[{index}].{field} must be an array")
+        citations = cluster.get("citations")
+        if not isinstance(citations, list) or not citations:
+            raise TraceAnalysisError(f"clusters[{index}].citations must be non-empty")
+        cited_trace_ids: set[str] = set()
+        cited_pairs: set[tuple[str, str]] = set()
+        for citation_value in citations:
+            citation = require_mapping(citation_value, f"clusters[{index}].citation")
+            pair = (citation.get("trace_id"), citation.get("span_id"))
+            expected = scan.citations_by_pair.get(pair)
+            if expected is None:
+                raise TraceAnalysisError(
+                    f"unknown trace/span citation: {pair[0]}/{pair[1]}"
+                )
+            if citation != expected.as_dict():
+                raise TraceAnalysisError(
+                    f"citation location mismatch: {pair[0]}/{pair[1]}"
+                )
+            if pair in cited_pairs:
+                raise TraceAnalysisError(f"clusters[{index}] has duplicate citations")
+            cited_pairs.add(pair)
+            cited_trace_ids.add(expected.trace_id)
+        trace_count = cluster.get("trace_count")
+        span_count = cluster.get("span_count")
+        prevalence = cluster.get("prevalence")
+        if (
+            not isinstance(trace_count, int)
+            or trace_count < len(cited_trace_ids)
+            or trace_count > len(scan.trace_ids)
+            or not isinstance(span_count, int)
+            or span_count < len(citations)
+            or not isinstance(prevalence, (int, float))
+            or not 0 <= prevalence <= 1
+            or abs(prevalence - trace_count / len(scan.trace_ids)) > 0.000001
+        ):
+            raise TraceAnalysisError(f"clusters[{index}] has invalid counts")
+        excluded_counterexamples = cited_trace_ids
+        if cluster["confidence"] == "deterministic_marker":
+            category = cluster["category"]
+            expected_citations = scan.categories.get(category)
+            if (
+                category not in FAILURE_CATEGORIES
+                or not expected_citations
+                or cluster["id"] != f"semantic.{category}"
+                or cluster["summary"] != SUMMARIES[category]
+                or cluster["hypothesis"] is not None
+            ):
+                raise TraceAnalysisError(
+                    f"clusters[{index}] has an invalid deterministic marker"
+                )
+            expected_pairs = {
+                (citation.trace_id, citation.span_id) for citation in expected_citations
+            }
+            expected_trace_ids = {citation.trace_id for citation in expected_citations}
+            if (
+                not cited_pairs <= expected_pairs
+                or trace_count != len(expected_trace_ids)
+                or span_count != len(expected_citations)
+            ):
+                raise TraceAnalysisError(
+                    f"clusters[{index}] deterministic counts or citations mismatch"
+                )
+            excluded_counterexamples = expected_trace_ids
+        counterexamples = cluster.get("counterexample_trace_ids")
+        if (
+            not isinstance(counterexamples, list)
+            or len(counterexamples) != len(set(counterexamples))
+            or any(
+                not isinstance(item, str)
+                or item not in scan.trace_ids
+                or item in excluded_counterexamples
+                for item in counterexamples
+            )
+        ):
+            raise TraceAnalysisError(
+                f"clusters[{index}] has invalid counterexample trace ids"
+            )
+    resources = require_mapping(root.get("resource_usage"), "resource_usage")
+    require_exact_fields(resources, RESOURCE_FIELDS, "resource_usage")
+    for field, expected in (
+        ("input_bytes", scan.input_bytes),
+        ("input_lines", scan.input_lines),
+        ("analyzed_spans", len(scan.citations_by_pair)),
+    ):
+        if resources.get(field) != expected:
+            raise TraceAnalysisError(f"resource_usage.{field} mismatch")
+    for field in (
+        "truncated_citations",
+        "max_input_bytes",
+        "max_line_bytes",
+        "max_report_bytes",
+        "max_citations_per_cluster",
+    ):
+        value = resources.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TraceAnalysisError(f"resource_usage.{field} is invalid")
+    if (
+        resources["max_input_bytes"] < scan.input_bytes
+        or resources["max_line_bytes"] < scan.largest_line_bytes
+        or resources["max_report_bytes"] < report_size_bytes
+        or resources["max_citations_per_cluster"] <= 0
+        or any(
+            len(cluster["citations"]) > resources["max_citations_per_cluster"]
+            for cluster in clusters
+        )
+    ):
+        raise TraceAnalysisError("resource_usage declared limits are invalid")
+    expected_truncated = sum(
+        cluster["span_count"] - len(cluster["citations"]) for cluster in clusters
+    )
+    if resources["truncated_citations"] != expected_truncated:
+        raise TraceAnalysisError("resource_usage.truncated_citations mismatch")
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        sources = resolve_sources(args.trace, max_input_bytes=args.max_input_bytes)
+        scan = scan_sources(
+            sources,
+            max_input_bytes=args.max_input_bytes,
+            max_line_bytes=args.max_line_bytes,
+        )
+        if args.validate_report is not None:
+            raw_report_path = args.validate_report.expanduser()
+            if raw_report_path.is_symlink():
+                raise TraceAnalysisError(
+                    f"report must not be a symlink: {args.validate_report}"
+                )
+            report_path = raw_report_path.resolve()
+            if not report_path.is_file():
+                raise TraceAnalysisError(
+                    f"report is not a regular file: {args.validate_report}"
+                )
+            try:
+                with report_path.open("rb") as handle:
+                    raw_report = handle.read(args.max_report_bytes + 1)
+                if len(raw_report) > args.max_report_bytes:
+                    raise TraceAnalysisError(
+                        "report exceeds max report bytes "
+                        f"({len(raw_report)} > {args.max_report_bytes})"
+                    )
+                report = json.loads(raw_report.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise TraceAnalysisError(f"report is unreadable: {exc}") from exc
+            validate_report(report, scan, report_size_bytes=len(raw_report))
+            print(f"trace-analysis: VALID: {report_path}")
+            return 0
+
+        assert args.output is not None
+        raw_output = args.output.expanduser()
+        if raw_output.is_symlink():
+            raise TraceAnalysisError("output must not be a symlink")
+        output = raw_output.resolve()
+        if output in sources:
+            raise TraceAnalysisError("output must not overwrite a trace source")
+        report = baseline_report(
+            scan,
+            max_input_bytes=args.max_input_bytes,
+            max_line_bytes=args.max_line_bytes,
+            max_report_bytes=args.max_report_bytes,
+            context_budget_bytes=args.context_budget_bytes,
+            rlm_min_traces=args.rlm_min_traces,
+            max_citations=args.max_citations_per_cluster,
+        )
+        serialized = (
+            json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        )
+        report_bytes = len(serialized.encode("utf-8"))
+        if report_bytes > args.max_report_bytes:
+            raise TraceAnalysisError(
+                "report exceeds max report bytes "
+                f"({report_bytes} > {args.max_report_bytes})"
+            )
+        validate_report(report, scan, report_size_bytes=report_bytes)
+        atomic_write_text(output, serialized, mode=0o600)
+        print(f"trace-analysis: wrote {output}")
+        return 0
+    except (OSError, TraceAnalysisError) as exc:
+        print(f"trace-analysis: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

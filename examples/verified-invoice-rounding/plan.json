@@ -1,0 +1,45 @@
+{
+  "schema": "workloop-plan/1",
+  "status": "ready",
+  "route": "verified",
+  "topology": "single_agent",
+  "coordinator_role": "workloop-coordinator",
+  "verification_owner_role": "builder",
+  "max_agent_depth": 0,
+  "verification_dimensions": [
+    "diff-scope",
+    "runtime-or-artifact",
+    "static-analysis",
+    "tests"
+  ],
+  "steps": [
+    {
+      "id": "round-invoice",
+      "description": "Implement cent-accurate invoice rounding and its regression test.",
+      "deliverable": "A bounded fixture change with a passing regression test.",
+      "owner_role": "builder",
+      "depends_on": [],
+      "goal_criteria": ["invoice-rounding"],
+      "check_ids": ["invoice-rounding-tests"],
+      "write_scope": ["examples/fixtures/invoice-rounding/"],
+      "capabilities": ["workspace-write"],
+      "effect": "workspace-local",
+      "approval": {
+        "required": false,
+        "status": "not-required",
+        "owner": "fixture-owner"
+      },
+      "rollback": "Revert the fixture-only change.",
+      "parallel_group": null
+    }
+  ],
+  "budget": {
+    "wall_clock_minutes": 15,
+    "retry_limit": 2
+  },
+  "stop_conditions": ["Stop after two failed full verification cycles."],
+  "fallback": {
+    "mode": "stop_and_handoff",
+    "trigger": "Use when deterministic invoice behavior cannot be reproduced."
+  }
+}

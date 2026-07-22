@@ -2,17 +2,25 @@
 
 # adaptive-workloop
 
-**A risk-based process router for non-trivial AI coding work.** It decides how much planning, verification, independent review, durability, and coordination a task deserves, while specialist Skills keep ownership of phase-local technique.
+**A risk-routed, evidence-gated orchestrator for non-trivial work.** Four properties set it apart: process **scales to task risk** (a typo and a prod migration do not get the same ceremony), completion is **proven with falsifiable, auditable evidence—not claims** (runnable where deterministic and attested where subjective), routing is **brand-blind across models** (an unknown model is a supported input, not a failure), and **demonstrated capability never expands authority**. Those properties ride a Goal→Plan→Do→Check→Act loop over four routes; specialist Skills keep ownership of phase-local technique.
 
 > Process is a cost. Spend it where failure is expensive and remove it where the bare model already succeeds.
 
-Status: **0.6.0 candidate**. Deterministic checksummed releases, digest-bound episode close-out, typed proposal validation, protected editable surfaces, sealed private evaluation, isolated independent graders, locked/atomic evidence writes, append-only whole-search accounting, observed-model identity gates, resumable three-condition matrices, paired confidence, fail-closed promotion decisions, provider adapters, CI, and Codex-standalone regressions are implemented. Real-model proposer-blind held-out and audit-held-out evidence is still required before stable promotion.
+Status: **0.7.0 candidate**. Goal/Plan gates, domain verification profiles, typed dispatch contracts, digest-bound episode close-out, candidate-only learning, protected Skill improvement, optional trace evidence mining, deterministic packaging, and Codex/Claude compatibility gates are implemented. Independent architectural review and real-model proposer-blind held-out/audit-held-out evidence are still required before stable promotion.
 
 ## When it activates
 
-Use it for multi-step work involving ambiguity, high-risk surfaces, weak verification, independent review, multiple sessions, or model/host capability differences. It also resumes existing `.workloop` episodes and handles explicit process-routing requests.
+Use it as the default outer loop for non-trivial engineering, research, writing/design, personal planning, and operational work involving ambiguity, high-risk surfaces, weak verification, independent review, multiple sessions, or model/host capability differences. It also resumes existing `.workloop` episodes and handles explicit process-routing requests.
 
-Ordinary one-step edits, isolated bug fixes, standalone reviews, Q&A, and prose remain on the host's normal fast path.
+Ordinary one-step edits, isolated bug fixes, standalone reviews, Q&A, translation, and one-shot drafting remain on the host's normal fast path.
+
+The PDCA control flow is:
+
+```text
+Goal Gate -> Plan Gate -> Dispatch/Do -> Check -> Act
+```
+
+Act may repair/close the task, record a Skill-improvement candidate, or record a Memory candidate. It never edits the Skill during the originating task and never writes directly to host Memory.
 
 ## Routes
 
@@ -27,7 +35,11 @@ Workloop owns route, gates, budgets, state, and orchestration. Delegated Skills 
 
 ## Safety and evidence
 
-Routes 2–4 create an episode containing an immutable manifest, mutable state, append-only events, human-readable contract, and structured `checks.json`.
+Routes 2–4 create a v3 episode containing an immutable manifest, `goal.json`, `plan.json`, mutable state, append-only events, a human-readable contract, structured `checks.json`, and an append-only learning-candidate log. Legacy v2 episodes remain readable.
+
+`scripts/validate-intent-plan` blocks execution until Goal status is `clear` or `assumption_bounded`; every Goal criterion maps to a Plan step and check; the dependency graph is acyclic; reviewed work has distinct verification ownership; profile dimensions are covered; and parallel write scopes do not overlap. `work.started` and final grading bind Goal, Plan, and check digests.
+
+Profiles are `engineering`, `research`, `writing_design`, `personal_planning`, and `high_stakes`. They define minimum Check dimensions, not permissions or mandatory specialist dependencies.
 
 Checks use argv arrays rather than shell strings:
 
@@ -49,6 +61,12 @@ Checks use argv arrays rather than shell strings:
 ```
 
 The verifier executes without a shell, constrains cwd to the repository, enforces timeouts, rejects unfilled templates and common zero-test greens, prints successful output, and writes grading artifacts. New manifests are bound to `episode.created`; `verification.passed` binds the current checks, per-check evidence, and grading digest, and `episode.closed` revalidates them. Append-only events remain the durable write-ahead record. Host sandbox, permissions, network policy, and user approval remain authoritative; verification is not a permission bypass.
+
+## Trace evidence mining
+
+`scripts/analyze-traces` provides a standard-library-only baseline over OTLP JSONL: it streams bounded input, binds source content by SHA-256, detects conservative semantic failure markers, emits real trace/span citations and counterexamples, and validates direct or bounded-RLM reports against the original files. It never returns raw payloads, calls a provider, edits the Skill, or authorizes promotion.
+
+Small inputs remain on `direct_baseline`. Large or cross-run corpora may become `bounded_rlm_candidate`, which only asks the existing Cost gate and host capability boundary whether one-level read-only delegation is worth its cost. HALO is not installed or required; see `references/trace-evidence.md` and `evals/trace-analysis-contract.md`.
 
 ## Install
 
@@ -102,9 +120,15 @@ Codex UI metadata lives in `agents/openai.yaml`; the Claude Code plugin manifest
 scripts/probe-capabilities . [--capabilities capabilities.json]
 
 # routes 2–4; Distributed defaults to tracked durable state
-scripts/create-episode --task "Add CSV importer" --route verified --model "unknown"
+scripts/create-episode --task "Add CSV importer" --route verified \
+  --profile engineering --model "unknown"
 
-# after contract.md and checks.json are ready
+# non-repository research/planning uses an explicit artifact root
+scripts/create-episode --task "Plan a three-month move" --route distributed \
+  --profile personal_planning --dir /path/to/private-artifacts --model "unknown"
+
+# after goal.json, plan.json, contract.md, and checks.json are ready
+scripts/validate-intent-plan .workloop/local/<episode-id>
 scripts/episode-state .workloop/local/<episode-id> --status in_progress --kind work.started
 
 # strict structured verification
@@ -119,9 +143,19 @@ scripts/episode-state .workloop/local/<episode-id> \
 # scan the Git-visible surface of a Distributed episode without printing secrets
 scripts/check-episode .workloop/tracked/<episode-id>
 
+# append an evidence-bound candidate; this never promotes Skill or Memory
+scripts/record-learning .workloop/local/<episode-id> \
+  --kind memory --claim "Reusable bounded claim" --scope project \
+  --evidence evidence/grading.json --writer current-agent \
+  --generalizability project --confidence 0.8 --dedupe-key reusable-bounded-claim
+
 # package and eval validation
 scripts/check
 scripts/run-evals --validate
+
+# digest-bound direct baseline, then validate the emitted report
+scripts/analyze-traces --trace traces.jsonl --output trace-report.json
+scripts/analyze-traces --trace traces.jsonl --validate-report trace-report.json
 
 # deterministic release directory, reproducible zip, and SHA-256 checksum
 scripts/package-skill
@@ -190,7 +224,7 @@ scripts/decide-promotion --policy evals/promotion-policy.json \
 ## Storage
 
 - Verified/Reviewed: `.workloop/local/` is ignored runtime state.
-- Distributed: `.workloop/tracked/` keeps redacted manifest/state/events/contract/checks/progress/handoff visible to Git; runtime, capability snapshots, and evidence remain ignored.
+- Distributed: `.workloop/tracked/` keeps redacted manifest/Goal/Plan/state/events/contract/checks/progress/handoff/learning candidates visible to Git; runtime, capability snapshots, locks, and evidence remain ignored.
 - `.workloop/proposals/` is not ignored, so accepted improvement proposals can survive review.
 
 An ephemeral workspace still needs an external issue/task store before claiming durable execution.
@@ -207,10 +241,13 @@ adaptive-workloop/
 ├── CHANGELOG.md · SECURITY.md · CONTRIBUTING.md
 ├── scripts/
 │   ├── probe-capabilities
+│   ├── analyze-traces
 │   ├── create-episode
+│   ├── validate-intent-plan
 │   ├── verify-contract
 │   ├── episode-state
 │   ├── check-episode
+│   ├── record-learning
 │   ├── run-evals
 │   ├── grade-evals
 │   ├── compare-evals
@@ -221,10 +258,12 @@ adaptive-workloop/
 │   ├── decide-promotion
 │   ├── package-skill
 │   └── check
-├── references/             # routes, verification, long-running, model-deltas, improvement
+├── references/             # Goal/Plan, profiles, routes, verification, Action/learning, recovery, improvement
 ├── assets/
 │   ├── contract.md
 │   ├── checks.json
+│   ├── goal.json
+│   ├── plan.json
 │   ├── progress.md
 │   └── handoff.md
 ├── evals/
@@ -232,6 +271,8 @@ adaptive-workloop/
 │   ├── behavior-cases.json
 │   ├── regression-cases.json
 │   ├── standalone-cases.json
+│   ├── trace-analysis-cases.json
+│   ├── trace-analysis-contract.md
 │   ├── profiles/codex-standalone.json
 │   ├── adapters/codex-cli
 │   ├── adapters/claude-code
@@ -266,7 +307,7 @@ The standalone suite fixes `installed_skills=[]`, `subagents=false`, and `browse
 
 Run the same fixtures separately for `bare`, an exact `--previous-skill` checkout, and `candidate`, with the same model, host, effort, tools, repository snapshot, grader, and runtime envelope. Use repeated trials and compare verified success, pass^k, human intervention, latency, cost, rollback, and incidents.
 
-Repository cases are public regressions, not held-out proof. Stable promotion requires separate private held-out and audit-held-out suites unavailable to the proposer, complete real-provider cost evidence, and human approval.
+Repository cases, including the trace-analysis fixtures, are public regressions and wiring checks—not held-out proof or evidence that RLM beats direct analysis. Stable promotion requires separate private held-out and audit-held-out suites unavailable to the proposer, complete real-provider cost evidence, and human approval.
 
 GitHub CI runs the deterministic gate and pinned Ruff checks on Python 3.10, 3.12, and 3.14 on Linux, plus Python 3.12 on macOS. It also validates the Agent Skills specification and Claude Code plugin manifest with pinned validator versions. The runtime package itself remains standard-library-only.
 
@@ -276,7 +317,7 @@ Routing never branches on model brand. Unknown models receive the same routes an
 
 ## Lineage
 
-The design combines harness-engineering's empirical controls, Waza's restraint, Superpowers' independent verification, gstack's runtime discipline, and mattpocock/skills' composability—without copying their full workflows or depending on those packages.
+The design combines harness-engineering's empirical controls, Waza's restraint, Superpowers' independent verification, gstack's runtime discipline, mattpocock/skills' composability, and HALO/RLM's externalized trace analysis—without copying their full workflows or depending on those packages.
 
 ## License
 

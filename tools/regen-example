@@ -15,8 +15,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_EXAMPLE = ROOT / "examples" / "verified-invoice-rounding"
-AUTHORED_FILES = ("contract.md", "checks.json", "progress.md", "handoff.md")
-DERIVED_FILES = ("manifest.json", "state.json", "events.jsonl")
+AUTHORED_FILES = (
+    "goal.json",
+    "plan.json",
+    "contract.md",
+    "checks.json",
+    "progress.md",
+    "handoff.md",
+)
+DERIVED_FILES = (
+    "manifest.json",
+    "state.json",
+    "events.jsonl",
+    "learning-candidates.jsonl",
+)
 TASK = "Add rounding to invoice totals with a regression test"
 DEFAULT_MODEL = "fixture-future-model"
 

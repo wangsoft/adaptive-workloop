@@ -16,6 +16,8 @@ contract, verification, and lifecycle state:
 | File | What it shows |
 |---|---|
 | `manifest.json` | Frozen facts: model (`fixture-future-model`, self-reported), host, route, repo head, and content digests. Immutable after creation. |
+| `goal.json` | Clear outcome, success criterion, scope, constraints, risk, and authority. |
+| `plan.json` | Ready single-agent topology with criterion/check mapping, budget, rollback, and fallback. |
 | `contract.md` | Human-readable outcome, scope, risk, and completion map. No executable commands live here. |
 | `checks.json` | One focused standard-library regression command with non-empty output assertions. |
 | `progress.md` | Durable state for checkpoint/resume. |
@@ -23,6 +25,7 @@ contract, verification, and lifecycle state:
 | `events.jsonl` | Append-only lifecycle: `created → work.started → verification.passed → episode.closed`. The durable write-ahead record. |
 | `state.json` | Cache of current status, reconciled from the event chain. |
 | `evidence/grading.json` | The complete `workloop-grading/1` result bound by digest to the `verification.passed` event. |
+| `learning-candidates.jsonl` | Empty by design: this fixture produced no generalizable learning candidate. |
 
 The takeaway: a provider-neutral future-model fixture ran the ordinary Verified
 route with no special-casing; `done` is backed by a non-empty green test run,
@@ -42,9 +45,9 @@ slice and more frequent `progress.md` checkpoints; see
 ## Maintainers
 
 `grading.json` embeds wall-clock timestamps, so regeneration is not byte-for-byte
-reproducible. `contract.md`, `checks.json`, `progress.md`, and `handoff.md` are
+reproducible. `goal.json`, `plan.json`, `contract.md`, `checks.json`, `progress.md`, and `handoff.md` are
 the authored source of truth; the lifecycle-derived files
-(`manifest.json`, `events.jsonl`, `state.json`, `evidence/`) are rebuilt by:
+(`manifest.json`, `events.jsonl`, `state.json`, `learning-candidates.jsonl`, `evidence/`) are rebuilt by:
 
 ```bash
 make regen-example

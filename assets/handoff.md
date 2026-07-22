@@ -9,6 +9,10 @@ episode: `{{EPISODE_ID}}` · slice: <name> · created: {{DATE}}
 <!-- One paragraph. An independently mergeable, independently verifiable outcome.
      If it's only useful after other slices land, it's not a slice — re-cut. -->
 
+- Goal criterion IDs: <IDs from goal.json>
+- Plan step ID: <ID from plan.json>
+- Deliverable: <one reviewable artifact or change>
+
 ## Read first (≤5 pointers)
 
 <!-- file:line — why it matters. Not a tour; the minimum to act safely. -->
@@ -22,6 +26,8 @@ episode: `{{EPISODE_ID}}` · slice: <name> · created: {{DATE}}
 - Non-goals:
 - Risk signals in play: <none | list — high-risk slices keep Reviewed discipline>
 - Capability scope: <tools, paths, network, permissions; narrower than coordinator>
+- Effect / approval: <workspace-local | external | irreversible> / <not-required | pending | approved>
+- Rollback and stop condition: <how to undo; when to stop>
 - Orchestration owner: <host-native | workloop coordinator; never nested>
 
 ## Verification

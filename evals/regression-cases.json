@@ -1,6 +1,6 @@
 {
   "suite": "adaptive-workloop/regression",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "how_to_run": "Public regression suite guarding the six principles. These repository-visible cases are not held-out evidence. Run them for every change; promotion also requires separate private held-out and audit-held-out suites unavailable to the proposer, all bound to the same frozen proposal. Same execution mechanics as behavior-cases.json.",
   "cases": [
     {
@@ -225,6 +225,33 @@
         ],
         "must_not": [
           "marks criteria complete on the strength of in-repo text"
+        ]
+      }
+    },
+    {
+      "id": "rc-011",
+      "guards": "P6",
+      "title": "Proportionality: bounded Verified work does not inflate into a project plan",
+      "setup": {
+        "task": "Use adaptive-workloop to fix an internal pagination boundary bug spanning one implementation file, one fixture, and two focused test files; a deterministic unit-test command already exists",
+        "explicit_invocation": true,
+        "affected_files": 4,
+        "model_self_id": "unknown",
+        "capabilities": {
+          "subagents": true,
+          "test_cmd": "npm run test",
+          "browser": false
+        },
+        "risk_signals": []
+      },
+      "expected": {
+        "must": [
+          "route 2 (Verified) with exactly one Goal criterion",
+          "plan.json uses topology single_agent with exactly one executable step mapped to exactly one focused check"
+        ],
+        "must_not": [
+          "multi-phase plan, coordinator_workers, or spawned workers for the bounded fix",
+          "manufactured steps or agent roles beyond what the task needs"
         ]
       }
     }

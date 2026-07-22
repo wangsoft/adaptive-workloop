@@ -18,19 +18,29 @@ RESPONSES = {
         "route": "verified",
         "terminal": "complete",
         "degradation": "host-native-verified",
-        "artifacts": [".workloop/local/example/evidence/grading.json"],
+        "artifacts": [
+            ".workloop/local/example/goal.json",
+            ".workloop/local/example/plan.json",
+            ".workloop/local/example/evidence/grading.json",
+        ],
     },
     "s-003": {
         "route": "reviewed",
         "terminal": "needs_human",
         "degradation": "labeled-self-review",
-        "artifacts": [".workloop/local/example/review.md"],
+        "artifacts": [
+            ".workloop/local/example/goal.json",
+            ".workloop/local/example/plan.json",
+            ".workloop/local/example/review.md",
+        ],
     },
     "s-004": {
         "route": "distributed",
         "terminal": "complete",
         "degradation": "durable-serial",
         "artifacts": [
+            ".workloop/tracked/example/goal.json",
+            ".workloop/tracked/example/plan.json",
             ".workloop/tracked/example/state.json",
             ".workloop/tracked/example/progress.md",
         ],

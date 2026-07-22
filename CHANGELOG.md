@@ -8,6 +8,16 @@ until real-model held-out evidence supports a stable tag (see
 ## [Unreleased]
 
 ### Changed
+- The runtime now uses Goal-gated PDCA: v3 episodes block execution until
+  `goal.json` and `plan.json` pass criterion/check coverage, DAG, ownership,
+  profile, budget, and parallel-write gates. Legacy v2 episodes remain readable.
+- The implicit scope now covers non-trivial engineering, research,
+  writing/design, personal planning, and operations while retaining the fast
+  path for one-step edits, Q&A, translation, and one-shot drafting.
+- P6 now makes process proportionality explicit. Public evals distinguish
+  bounded Verified work from Direct work with observable scope facts and exact
+  single-step assertions; subjective completion uses named, auditable
+  attestation instead of decorative deterministic checks.
 - Installation docs now use the published `wangsoft/adaptive-workloop` GitHub
   source for Codex, Agent Skills hosts, and the Claude Code marketplace.
 
@@ -24,6 +34,14 @@ until real-model held-out evidence supports a stable tag (see
   and can run their own deterministic integrity check without source tests.
 
 ### Added
+- Domain verification profiles, typed agent dispatch envelopes, Goal/Plan
+  digest binding, and an append-only `record-learning` candidate log. Skill
+  changes still require the separate improvement protocol; Memory candidates
+  are never promoted without explicit user-approved host integration.
+- Optional recursive trace evidence mining: a SHA-256-bound OTLP JSONL baseline,
+  stable trace/span citations, semantic failure clusters, report validation,
+  one-level RLM candidacy gate, provider-neutral contract, public fixtures, and
+  a direct fallback with no HALO or provider dependency.
 - `make regen-example` safely rebuilds the sample through the real lifecycle so
   its manifest, events, grading, and per-check evidence stay digest-consistent;
   timestamps and durations intentionally remain volatile.

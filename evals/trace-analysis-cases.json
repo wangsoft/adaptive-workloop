@@ -1,0 +1,30 @@
+{
+  "schema": "workloop-trace-analysis-cases/1",
+  "evidence_class": "public",
+  "revision": "1",
+  "cases": [
+    {
+      "id": "ta-direct-small",
+      "fixture": "evals/fixtures/trace-analysis/semantic-failures.jsonl",
+      "arguments": {},
+      "expected": {
+        "route": "direct_baseline",
+        "categories": ["otel_error", "incomplete", "timeout", "refusal", "max_steps"],
+        "promotion_authorized": false
+      }
+    },
+    {
+      "id": "ta-bounded-rlm-candidate",
+      "fixture": "evals/fixtures/trace-analysis/semantic-failures.jsonl",
+      "arguments": {
+        "rlm_min_traces": 2
+      },
+      "expected": {
+        "route": "bounded_rlm_candidate",
+        "maximum_depth": 1,
+        "fallback": "direct_baseline",
+        "promotion_authorized": false
+      }
+    }
+  ]
+}

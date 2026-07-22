@@ -1,0 +1,20 @@
+{
+  "schema": "workloop-plan/1",
+  "status": "draft",
+  "route": "verified",
+  "topology": "single_agent",
+  "coordinator_role": "workloop-coordinator",
+  "verification_owner_role": "workloop-coordinator",
+  "max_agent_depth": 0,
+  "verification_dimensions": [],
+  "steps": [],
+  "budget": {
+    "wall_clock_minutes": 60,
+    "retry_limit": 2
+  },
+  "stop_conditions": ["Stop when a blocking unknown, missing authority, or budget limit is reached."],
+  "fallback": {
+    "mode": "stop_and_handoff",
+    "trigger": "Use when the plan cannot be made executable within current authority."
+  }
+}

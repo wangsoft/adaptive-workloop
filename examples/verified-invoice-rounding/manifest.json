@@ -1,7 +1,7 @@
 {
   "capability_manifest_digest": null,
-  "created_at": "2026-07-20T06:55:15Z",
-  "episode_id": "20260720-065515-regen-example-544db8d5",
+  "created_at": "2026-07-22T06:11:26Z",
+  "episode_id": "20260722-061126-regen-example-fea0aabe",
   "host": {
     "evidence": "no supported host marker; self-report is allowed",
     "name": "unknown"
@@ -12,21 +12,28 @@
   },
   "repo": {
     "branch": "main",
-    "dirty_files": 47,
-    "file_count": 60,
-    "head": "813a07a9d2713dd24187512ed64f3ee0b2595162",
+    "dirty_files": 56,
+    "file_count": 84,
+    "head": "4751b6914605a6d8a4ce121f923f817a4e9db31f",
     "root": ".",
     "snapshot_schema": "workloop-repo-snapshot/1",
-    "state_digest": "sha256:41f1533ea99a0b26e75a4e9576e199467a49f3d9c6814794bccd02b829bde2a7"
+    "state_digest": "sha256:e06fb04df902f19c5c7c8bf9ea8541b49140aee4d821cfae6f02402f5f5372e4"
   },
   "route": "verified",
-  "runtime_probe_digest": "sha256:d64a1baa586bb370024bf980b684bba110f23f9326f93e90a58fe8ba5cf9b474",
-  "schema": "workloop-episode/2",
+  "runtime_probe_digest": "sha256:090deae4e4860b8ed7bc46a5b57953053a328c482ea860f8070a737bfeb4aaf3",
+  "schema": "workloop-episode/3",
   "skill": {
-    "digest": "sha256:a26e7002a5775d73e4143a80fd1f1f983d18fdaefc12b07266f6b7cb4fea507a",
+    "digest": "sha256:1fcc12c2e3b3c78c83d8b2ea7024a0bae828644bed02a1461694abbb45f4e76b",
     "name": "adaptive-workloop",
-    "version": "0.6.0"
+    "version": "0.7.0"
   },
   "storage": "local",
-  "task": "Add rounding to invoice totals with a regression test"
+  "task": "Add rounding to invoice totals with a regression test",
+  "work_domain": {
+    "profile": "engineering"
+  },
+  "workspace": {
+    "kind": "git",
+    "root": "."
+  }
 }

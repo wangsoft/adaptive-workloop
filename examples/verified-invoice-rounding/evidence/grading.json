@@ -1,7 +1,9 @@
 {
   "checks_digest": "sha256:ba98c39651578b02dab89551aa228bb290b6ef3d8691bf53d9e2f91e082a8305",
-  "graded_at": "2026-07-20T06:55:16Z",
+  "goal_digest": "sha256:cb61a64980379f72025276c20b59d68804c0c3b211c7f31232c1b6b44b885585",
+  "graded_at": "2026-07-22T06:11:26Z",
   "manual": [],
+  "plan_digest": "sha256:2b5e8812c71721c2beaca5e12ebea712addba7ac6ee99bd425a2f9fa7ab92652",
   "results": [
     {
       "argv": [
@@ -17,7 +19,7 @@
       ],
       "cwd": "examples/fixtures/invoice-rounding",
       "description": "focused invoice rounding tests exercise boundary, tax, and decimal behavior",
-      "duration_ms": 69,
+      "duration_ms": 56,
       "error": null,
       "expected_exit": 0,
       "hollow_output_patterns": [],
@@ -27,7 +29,7 @@
       "passed": true,
       "returncode": 0,
       "risk": "workspace-local",
-      "started_at": "2026-07-20T06:55:16Z",
+      "started_at": "2026-07-22T06:11:26Z",
       "stderr": "test_applies_tax_before_rounding (test_invoice_rounding.InvoiceRoundingTests.test_applies_tax_before_rounding) ... ok\ntest_decimal_input_avoids_binary_float_drift (test_invoice_rounding.InvoiceRoundingTests.test_decimal_input_avoids_binary_float_drift) ... ok\ntest_rounds_half_up_at_the_currency_boundary (test_invoice_rounding.InvoiceRoundingTests.test_rounds_half_up_at_the_currency_boundary) ... ok\n\n----------------------------------------------------------------------\nRan 3 tests in 0.000s\n\nOK\n",
       "stdout": "",
       "terminal": "pass"

@@ -20,9 +20,12 @@ from workloop_core import validate_release_manifest  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_NAMES = (
     "probe-capabilities",
+    "analyze-traces",
     "create-episode",
     "verify-contract",
     "episode-state",
+    "validate-intent-plan",
+    "record-learning",
     "check-episode",
     "run-evals",
     "grade-evals",
@@ -92,9 +95,8 @@ def validate_frontmatter() -> None:
 
 def validate_json() -> None:
     paths = sorted((ROOT / "evals").glob("*.json"))
-    paths.extend(
-        [ROOT / "assets" / "checks.json", ROOT / "references" / "model-deltas.json"]
-    )
+    paths.extend(sorted((ROOT / "assets").glob("*.json")))
+    paths.append(ROOT / "references" / "model-deltas.json")
     for path in paths:
         try:
             json.loads(path.read_text(encoding="utf-8"))

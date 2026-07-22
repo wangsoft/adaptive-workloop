@@ -1,0 +1,62 @@
+{
+  "schema": "workloop-core-cases/1",
+  "purpose": "Outcome-graded core-value comparison. Question: does an agent WITH adaptive-workloop produce better OUTCOMES than the SAME bare model WITHOUT it, on realistic coding tasks? Success is the fixture's own check passing after the agent works — measured identically for bare and workloop. This is the evidence P6 demands: proof the skill beats the bare model, not proof that routing mechanics are internally consistent.",
+  "grading": "Deterministic and outcome-based, never an LLM judge. Before grading, the runner restores each case's canonical check files from graded/ over the agent's workspace, so a run cannot pass by weakening or deleting the test (the skill's own hollow-green rule, applied to the eval itself).",
+  "cases": [
+    {
+      "id": "cv-001",
+      "title": "Off-by-one in pagination slice",
+      "risk": "low",
+      "expected_route_hint": "verified",
+      "why_process_helps": "A deterministic test exists; the Verified route forces it to actually run before 'done'. A bare model may claim the fix works without executing it.",
+      "fixture": "fixtures/pagination",
+      "prompt": "paginate(items, page, per_page) in pagination.py returns the wrong slice — page 1 should be the first per_page items. Fix the bug. A test suite is in test_pagination.py.",
+      "check": { "argv": ["python3", "-m", "unittest", "-v", "test_pagination.py"], "expected_exit": 0 },
+      "canonical_files": ["test_pagination.py"]
+    },
+    {
+      "id": "cv-002",
+      "title": "Class-of-bug: same missing guard in two call sites",
+      "risk": "medium",
+      "expected_route_hint": "verified",
+      "why_process_helps": "The review discipline (pattern-fix completeness) sweeps sibling instances; a bare model often fixes only the reported call site and leaves the twin.",
+      "fixture": "fixtures/pattern-fix",
+      "prompt": "discounts.py crashes on an empty cart in the reported path. Fix it. Note there may be more than one place with the same shape. Tests are in test_discounts.py.",
+      "check": { "argv": ["python3", "-m", "unittest", "-v", "test_discounts.py"], "expected_exit": 0 },
+      "canonical_files": ["test_discounts.py"]
+    },
+    {
+      "id": "cv-003",
+      "title": "Auth token expiry boundary (high-risk)",
+      "risk": "high",
+      "expected_route_hint": "reviewed",
+      "why_process_helps": "Auth is a high-risk signal → Reviewed route + independent verification + boundary attack. A bare model may fix the happy path and miss the exact-expiry edge.",
+      "fixture": "fixtures/token-expiry",
+      "prompt": "is_expired(token, now) in auth.py mishandles the exact-expiry boundary. A token AT its expiry instant must count as expired. Fix it without weakening any other case. Tests are in test_auth.py.",
+      "check": { "argv": ["python3", "-m", "unittest", "-v", "test_auth.py"], "expected_exit": 0 },
+      "canonical_files": ["test_auth.py"]
+    },
+    {
+      "id": "cv-004",
+      "title": "Currency rounding drift (decimal)",
+      "risk": "medium",
+      "expected_route_hint": "verified",
+      "why_process_helps": "The regression-test-first habit pins the invariant (half-up at the cent) instead of tuning a float until it looks right.",
+      "fixture": "fixtures/rounding",
+      "prompt": "total(amounts) in billing.py accumulates binary-float drift and rounds inconsistently. Totals must be correct to the cent with half-up rounding. Fix it. Tests are in test_billing.py.",
+      "check": { "argv": ["python3", "-m", "unittest", "-v", "test_billing.py"], "expected_exit": 0 },
+      "canonical_files": ["test_billing.py"]
+    },
+    {
+      "id": "cv-005",
+      "title": "Retry backoff never caps",
+      "risk": "medium",
+      "expected_route_hint": "verified",
+      "why_process_helps": "Verification catches that the fix must both cap the delay AND stop after max attempts; a partial fix passes one and fails the other.",
+      "fixture": "fixtures/retry",
+      "prompt": "backoff_delays(attempts, base, cap) in retry.py grows without honoring the cap and returns the wrong count. Delays must be capped and there must be exactly `attempts` of them. Fix it. Tests are in test_retry.py.",
+      "check": { "argv": ["python3", "-m", "unittest", "-v", "test_retry.py"], "expected_exit": 0 },
+      "canonical_files": ["test_retry.py"]
+    }
+  ]
+}

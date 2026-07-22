@@ -1,7 +1,7 @@
 interface:
   display_name: "Adaptive Workloop"
-  short_description: "Route complex engineering work by risk"
-  default_prompt: "Use $adaptive-workloop to choose and run the smallest verifiable workflow for this engineering task."
+  short_description: "Run Goal-gated PDCA for non-trivial work"
+  default_prompt: "Use $adaptive-workloop to clarify the Goal, validate the Plan, dispatch bounded work, check evidence, and control learning."
 
 policy:
   allow_implicit_invocation: true

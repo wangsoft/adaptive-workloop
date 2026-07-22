@@ -27,6 +27,9 @@ assets/
 evals/adapters/
 evals/profiles/
 evals/adapter-contract.md
+evals/trace-analysis-contract.md
+evals/trace-analysis-cases.json
+evals/fixtures/trace-analysis/
 evals/grader-contract.md
 evals/matrix-protocol.md
 evals/proposal-contract.md

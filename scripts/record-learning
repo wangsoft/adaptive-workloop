@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Append one evidence-bound Skill, project, or Memory learning candidate."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+sys.dont_write_bytecode = True
+from workloop_core import redact_evidence_text  # noqa: E402
+
+
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+
+def die(message: str) -> int:
+    print(f"record-learning: {message}", file=sys.stderr)
+    return 2
+
+
+def digest_bytes(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def canonical_digest(value: dict[str, Any]) -> str:
+    return digest_bytes(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("episode", type=Path)
+    parser.add_argument("--kind", required=True, choices=("skill", "project", "memory"))
+    parser.add_argument("--claim", required=True)
+    parser.add_argument("--scope", required=True)
+    parser.add_argument("--evidence", action="append", required=True)
+    parser.add_argument("--writer", required=True)
+    parser.add_argument(
+        "--generalizability",
+        required=True,
+        choices=("episode", "project", "user", "global"),
+    )
+    parser.add_argument("--confidence", required=True, type=float)
+    parser.add_argument("--dedupe-key", required=True)
+    parser.add_argument(
+        "--sensitivity",
+        choices=("none", "internal", "personal", "secret"),
+        default="none",
+    )
+    parser.add_argument("--expires-at")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    episode = args.episode.resolve()
+    if not episode.is_dir():
+        return die(f"episode not found: {episode}")
+    if args.sensitivity == "secret":
+        return die("secret candidates may not be persisted")
+    for label, value in (
+        ("claim", args.claim),
+        ("scope", args.scope),
+        ("writer", args.writer),
+    ):
+        if not value.strip() or "\n" in value or "\r" in value:
+            return die(f"--{label} must be one non-empty line")
+        if redact_evidence_text(value) != value:
+            return die(f"--{label} appears to contain secret material")
+    if not ID_RE.fullmatch(args.dedupe_key):
+        return die("--dedupe-key must be a lowercase dashed identifier")
+    if not 0 <= args.confidence <= 1:
+        return die("--confidence must be between 0 and 1")
+    if args.expires_at:
+        try:
+            datetime.strptime(args.expires_at, "%Y-%m-%d")
+        except ValueError:
+            return die("--expires-at must use YYYY-MM-DD")
+
+    manifest_path = episode / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return die(f"cannot read manifest.json: {exc}")
+    if not isinstance(manifest, dict) or manifest.get("schema") != "workloop-episode/3":
+        return die("learning candidates require a workloop-episode/3 episode")
+
+    evidence: list[dict[str, str]] = []
+    for raw in args.evidence:
+        relative = Path(raw)
+        if relative.is_absolute():
+            return die("evidence paths must be relative to the episode")
+        candidate = episode / relative
+        if candidate.is_symlink() or not candidate.is_file():
+            return die(f"evidence is not a regular file: {raw}")
+        try:
+            normalized = candidate.resolve().relative_to(episode).as_posix()
+        except ValueError:
+            return die(f"evidence escapes the episode: {raw}")
+        evidence.append(
+            {"path": normalized, "digest": digest_bytes(candidate.read_bytes())}
+        )
+
+    output = episode / "learning-candidates.jsonl"
+    lock_path = episode / ".learning.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        lines = (
+            output.read_text(encoding="utf-8").splitlines() if output.exists() else []
+        )
+        previous_digest: str | None = None
+        for index, line in enumerate(lines, start=1):
+            try:
+                existing = json.loads(line)
+            except json.JSONDecodeError as exc:
+                return die(f"learning-candidates.jsonl line {index} is invalid: {exc}")
+            if not isinstance(existing, dict) or existing.get("seq") != index:
+                return die(f"learning-candidates.jsonl line {index} breaks sequence")
+            recorded_digest = existing.get("event_digest")
+            payload = {
+                key: value for key, value in existing.items() if key != "event_digest"
+            }
+            if existing.get("previous_event_digest") != previous_digest:
+                return die(
+                    f"learning-candidates.jsonl line {index} breaks digest chain"
+                )
+            if recorded_digest != canonical_digest(payload):
+                return die(f"learning-candidates.jsonl line {index} has invalid digest")
+            if (
+                existing.get("kind") == args.kind
+                and existing.get("dedupe_key") == args.dedupe_key
+                and existing.get("status") == "candidate"
+            ):
+                return die("an active candidate already uses this kind and dedupe key")
+            previous_digest = recorded_digest
+
+        event: dict[str, Any] = {
+            "schema": "workloop-learning/1",
+            "seq": len(lines) + 1,
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "episode_id": manifest.get("episode_id"),
+            "kind": args.kind,
+            "status": "candidate",
+            "claim": args.claim.strip(),
+            "scope": args.scope.strip(),
+            "evidence": evidence,
+            "provenance": {"writer": args.writer.strip(), "source": "episode-evidence"},
+            "generalizability": args.generalizability,
+            "sensitivity": args.sensitivity,
+            "confidence": args.confidence,
+            "dedupe_key": args.dedupe_key,
+            "expires_at": args.expires_at,
+            "review_required": True,
+            "promotion": {
+                "requires_explicit_approval": True,
+                "requires_user_approval": args.kind == "memory",
+                "performed": False,
+                "destination": None,
+            },
+            "previous_event_digest": previous_digest,
+        }
+        event["event_digest"] = canonical_digest(event)
+        with output.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory = os.open(episode, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    print(f"record-learning: candidate {event['seq']} recorded; no promotion performed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

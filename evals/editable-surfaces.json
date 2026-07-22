@@ -6,6 +6,7 @@
     "evals/editable-surfaces.json",
     "evals/profiles",
     "evals/promotion-policy.json",
+    "references/action-learning.md",
     "scripts"
   ],
   "surfaces": [
@@ -33,10 +34,37 @@
       "validators": [["scripts/check"]]
     },
     {
+      "id": "goal-plan.guidance",
+      "paths": ["references/goal-plan.md"],
+      "hooks": ["goal.gate", "plan.gate", "dispatch.envelope"],
+      "mechanism_families": ["routing_rule", "verification_rule", "runtime_control"],
+      "risk": "high",
+      "review_required": true,
+      "validators": [["scripts/check"]]
+    },
+    {
+      "id": "domain.profile.guidance",
+      "paths": ["references/domain-profiles.md"],
+      "hooks": ["verification.profile"],
+      "mechanism_families": ["verification_rule"],
+      "risk": "high",
+      "review_required": true,
+      "validators": [["scripts/check"]]
+    },
+    {
       "id": "verification.guidance",
       "paths": ["references/verification.md"],
       "hooks": ["verification.contract", "verification.closeout"],
       "mechanism_families": ["verification_rule"],
+      "risk": "high",
+      "review_required": true,
+      "validators": [["scripts/check"]]
+    },
+    {
+      "id": "trace.analysis.guidance",
+      "paths": ["references/trace-evidence.md"],
+      "hooks": ["trace.route.entry", "trace.cluster.contract"],
+      "mechanism_families": ["routing_rule", "retrieval_rule"],
       "risk": "high",
       "review_required": true,
       "validators": [["scripts/check"]]
@@ -53,7 +81,7 @@
     {
       "id": "episode.templates",
       "paths": ["assets"],
-      "hooks": ["episode.contract", "episode.checks", "episode.progress", "episode.handoff"],
+      "hooks": ["episode.goal", "episode.plan", "episode.contract", "episode.checks", "episode.progress", "episode.handoff"],
       "mechanism_families": ["contract_template", "verification_rule"],
       "risk": "medium",
       "review_required": true,

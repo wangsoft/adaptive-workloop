@@ -1,0 +1,30 @@
+{
+  "schema": "workloop-goal/1",
+  "status": "clear",
+  "profile": "engineering",
+  "outcome": "Add cent-accurate rounding to invoice totals and prove it with a regression test.",
+  "success_criteria": [
+    {
+      "id": "invoice-rounding",
+      "description": "Invoice totals round to two decimal places and the regression suite passes."
+    }
+  ],
+  "scope": {
+    "in": ["the invoice-rounding fixture and its regression test"],
+    "non_goals": ["currency conversion and external release"]
+  },
+  "constraints": ["Use deterministic standard-library decimal behavior."],
+  "risks": [
+    {
+      "id": "rounding-regression",
+      "description": "Binary floating-point could produce cent-level errors.",
+      "mitigation": "Exercise the exact regression cases with Decimal-based expectations."
+    }
+  ],
+  "unknowns": [],
+  "authority": {
+    "decision_owner": "fixture-owner",
+    "allowed_actions": ["workspace-local"],
+    "approval_required": []
+  }
+}
